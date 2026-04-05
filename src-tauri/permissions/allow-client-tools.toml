@@ -1,0 +1,15 @@
+# Allow frontend invoke() for local automation and app config commands.
+# Tauri 2 ACL: custom commands must be listed or IPC returns permission denied.
+[[permission]]
+identifier = "allow-client-tools"
+description = "Allow local tool commands and config commands"
+commands.allow = [
+  "get_server_url",
+  "save_server_url",
+  "get_config_path",
+  "read_picked_file_base64",
+  "run_client_docker_operator",
+  "run_client_browser",
+  "execute_wasm_command",
+  "execute_js_command",
+]

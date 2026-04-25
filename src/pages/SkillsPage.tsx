@@ -37,6 +37,7 @@ const skillIcons: Record<string, string> = {
   ssh_executor: '💻',
   k8s_operator: '☸️',
   db_query: '🗄️',
+  redis_tool: '🔴',
   http_client: '📡',
   prometheus_query: '📈',
   grafana_reader: '📉',
@@ -235,7 +236,9 @@ const SkillsPage: React.FC = () => {
           </Grid>
         ) : (
           <Grid container spacing={2}>
-            {paginatedSkills.map((skill) => (
+            {paginatedSkills.map((skill) => {
+              const categoryLabel = translateCategory(skill.category ?? '').trim();
+              return (
               <Grid key={skill.id} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
                 <Card
                   elevation={0}
@@ -328,13 +331,15 @@ const SkillsPage: React.FC = () => {
                     </Tooltip>
 
                     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
-                      <Chip
-                        size="small"
-                        label={translateCategory(skill.category)}
-                        color={getCategoryColor(skill.category)}
-                        variant="outlined"
-                        sx={{ fontSize: '0.7rem' }}
-                      />
+                      {categoryLabel ? (
+                        <Chip
+                          size="small"
+                          label={categoryLabel}
+                          color={getCategoryColor(skill.category)}
+                          variant="outlined"
+                          sx={{ fontSize: '0.7rem' }}
+                        />
+                      ) : null}
                       <Chip
                         size="small"
                         label={translateRisk(skill.risk_level)}
@@ -352,7 +357,8 @@ const SkillsPage: React.FC = () => {
                   </CardContent>
                 </Card>
               </Grid>
-            ))}
+              );
+            })}
             {skills.length === 0 && !loading && (
               <Grid size={12}>
                 <Box sx={{ textAlign: 'center', py: 8 }}>

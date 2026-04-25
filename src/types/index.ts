@@ -150,6 +150,10 @@ export interface ClientToolCall {
   risk_level?: string;
   /** `client` | `server` from skill/tool metadata; desktop confirms only client + risk > low */
   execution_mode?: string;
+  /** When set, smart体审批策略要求先走 Approvals，通过后再执行本地 Tauri */
+  approval_id?: number;
+  /** Set only after external approval resolved — skip desktop risk confirmation dialog */
+  skip_local_confirm?: boolean;
 }
 
 export interface APIResponse<T = any> {
@@ -161,6 +165,12 @@ export interface APIResponse<T = any> {
 export interface ApprovalRequest {
   id: number;
   agent_id: number;
+  /** Display name from server; prefer over raw id in UI */
+  agent_name?: string;
+  /** Usernames configured on the agent as approvers */
+  designated_approvers?: string[];
+  /** Whether the current session user may approve/reject this pending request */
+  can_approve?: boolean;
   session_id: string;
   user_id: string;
   tool_name: string;

@@ -6,7 +6,8 @@ const accentLightMode = '#0d9488';
 const sharedShape = { borderRadius: 10 };
 
 const sharedTypography = {
-  fontFamily: '"Inter", "Segoe UI", "Helvetica Neue", system-ui, sans-serif',
+  fontFamily:
+    'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
   h5: { fontWeight: 700, letterSpacing: '-0.02em' },
   h6: { fontWeight: 600 },
   subtitle2: { fontWeight: 600 },

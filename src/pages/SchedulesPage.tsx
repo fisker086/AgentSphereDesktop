@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -62,6 +62,15 @@ function scheduleKindLabel(kind: string, t: (key: string) => string): string {
   }
 }
 
+/** API 常不返回 agent_name；用已拉取的 agents 列表补全，避免表格只显示「Agent #3」 */
+function resolveScheduleAgentName(schedule: Schedule, agentList: Agent[]): string {
+  const fromApi = schedule.agent_name?.trim();
+  if (fromApi) return fromApi;
+  const a = agentList.find((x) => x.id === schedule.agent_id);
+  if (a?.name?.trim()) return a.name.trim();
+  return `Agent #${schedule.agent_id}`;
+}
+
 const SchedulesPage: React.FC = () => {
   const { t } = useTranslation();
   const [schedules, setSchedules] = useState<Schedule[]>([]);
@@ -70,6 +79,10 @@ const SchedulesPage: React.FC = () => {
   const [agentsLoading, setAgentsLoading] = useState(false);
   const [createDialog, setCreateDialog] = useState(false);
   const [executions, setExecutions] = useState<Record<number, ScheduleExecution[]>>({});
+  /** 展开查看执行记录的行（与是否已加载数据无关，避免只能展开不能收起） */
+  const [expandedScheduleIds, setExpandedScheduleIds] = useState<Set<number>>(() => new Set());
+  const [executionsLoadingById, setExecutionsLoadingById] = useState<Record<number, boolean>>({});
+  const [triggeringScheduleId, setTriggeringScheduleId] = useState<number | null>(null);
   const [error, setError] = useState('');
 
   const [form, setForm] = useState<CreateScheduleRequest>({
@@ -139,22 +152,54 @@ const SchedulesPage: React.FC = () => {
     }
   };
 
-  const handleTrigger = async (id: number) => {
-    try {
-      await triggerSchedule(id);
-      const execs = await listScheduleExecutions(id);
-      setExecutions((prev) => ({ ...prev, [id]: execs }));
-    } catch {
-      setError(t('errors.scheduleTriggerFailed'));
-    }
+  const loadExecutions = useCallback(
+    async (id: number) => {
+      setExecutionsLoadingById((p) => ({ ...p, [id]: true }));
+      try {
+        const execs = await listScheduleExecutions(id);
+        setExecutions((prev) => ({ ...prev, [id]: execs }));
+      } catch {
+        setError(t('errors.scheduleExecutionsLoadFailed'));
+      } finally {
+        setExecutionsLoadingById((p) => ({ ...p, [id]: false }));
+      }
+    },
+    [t],
+  );
+
+  /** 展开/收起执行记录；首次展开时拉取列表 */
+  const toggleExecutionsPanel = (id: number) => {
+    setExpandedScheduleIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+        return next;
+      }
+      next.add(id);
+      return next;
+    });
   };
 
-  const loadExecutions = async (id: number) => {
+  useEffect(() => {
+    expandedScheduleIds.forEach((id) => {
+      if (executions[id] === undefined) {
+        void loadExecutions(id);
+      }
+    });
+    // 仅在展开集合变化时拉取；executions 用于判断是否需要首次加载（避免 deps 含 executions 导致多余 effect）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedScheduleIds, loadExecutions]);
+
+  const handleTrigger = async (id: number) => {
+    setTriggeringScheduleId(id);
     try {
-      const execs = await listScheduleExecutions(id);
-      setExecutions((prev) => ({ ...prev, [id]: execs }));
+      await triggerSchedule(id);
+      await loadExecutions(id);
+      setExpandedScheduleIds((prev) => new Set(prev).add(id));
     } catch {
-      setError(t('errors.scheduleExecutionsLoadFailed'));
+      setError(t('errors.scheduleTriggerFailed'));
+    } finally {
+      setTriggeringScheduleId(null);
     }
   };
 
@@ -333,12 +378,16 @@ const SchedulesPage: React.FC = () => {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {filtered.map((schedule) => (
+                {filtered.map((schedule) => {
+                  const agentLabel = resolveScheduleAgentName(schedule, agents);
+                  return (
                   <React.Fragment key={schedule.id}>
                     <TableRow
                       hover
                       sx={{
-                        '&:last-child td': { borderBottom: executions[schedule.id] ? undefined : 0 },
+                        '&:last-child td': {
+                          borderBottom: expandedScheduleIds.has(schedule.id) ? undefined : 0,
+                        },
                         transition: 'background-color 0.15s ease',
                       }}
                     >
@@ -353,11 +402,13 @@ const SchedulesPage: React.FC = () => {
                         ) : null}
                       </TableCell>
                       <TableCell>
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <SmartToyIcon sx={{ fontSize: 18, color: 'action.active' }} />
-                          <Typography variant="body2">
-                            {schedule.agent_name || `Agent #${schedule.agent_id}`}
-                          </Typography>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+                          <SmartToyIcon sx={{ fontSize: 18, color: 'action.active', flexShrink: 0 }} />
+                          <Tooltip title={agentLabel} placement="top">
+                            <Typography variant="body2" noWrap sx={{ maxWidth: 320 }}>
+                              {agentLabel}
+                            </Typography>
+                          </Tooltip>
                         </Box>
                       </TableCell>
                       <TableCell>
@@ -419,12 +470,32 @@ const SchedulesPage: React.FC = () => {
                       </TableCell>
                       <TableCell align="right">
                         <Tooltip title={t('schedules.triggerNow')}>
-                          <IconButton size="small" onClick={() => void handleTrigger(schedule.id)} color="primary">
-                            <PlayIcon fontSize="small" />
-                          </IconButton>
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => void handleTrigger(schedule.id)}
+                              color="primary"
+                              disabled={triggeringScheduleId === schedule.id}
+                            >
+                              {triggeringScheduleId === schedule.id ? (
+                                <CircularProgress size={18} color="inherit" />
+                              ) : (
+                                <PlayIcon fontSize="small" />
+                              )}
+                            </IconButton>
+                          </span>
                         </Tooltip>
                         <Tooltip title={t('schedules.viewExecutions')}>
-                          <IconButton size="small" onClick={() => void loadExecutions(schedule.id)}>
+                          <IconButton
+                            size="small"
+                            onClick={() => toggleExecutionsPanel(schedule.id)}
+                            sx={{
+                              '& .MuiSvgIcon-root': {
+                                transform: expandedScheduleIds.has(schedule.id) ? 'rotate(180deg)' : 'none',
+                                transition: 'transform 0.2s ease',
+                              },
+                            }}
+                          >
                             <ExpandMoreIcon fontSize="small" />
                           </IconButton>
                         </Tooltip>
@@ -435,7 +506,7 @@ const SchedulesPage: React.FC = () => {
                         </Tooltip>
                       </TableCell>
                     </TableRow>
-                    {executions[schedule.id] && (
+                    {expandedScheduleIds.has(schedule.id) && (
                       <TableRow>
                         <TableCell colSpan={7} sx={{ p: 0, borderBottom: 'none' }}>
                           <Box
@@ -453,52 +524,59 @@ const SchedulesPage: React.FC = () => {
                             <Typography variant="subtitle2" fontWeight={700} color="text.secondary" sx={{ mb: 1.5 }}>
                               {t('schedules.executionHistory')}
                             </Typography>
-                            <Table size="small">
-                              <TableHead>
-                                <TableRow>
-                                  <TableCell sx={{ fontWeight: 600 }}>{t('schedules.startedAt')}</TableCell>
-                                  <TableCell sx={{ fontWeight: 600 }}>{t('schedules.runStatus')}</TableCell>
-                                  <TableCell sx={{ fontWeight: 600 }}>{t('schedules.duration')}</TableCell>
-                                  <TableCell sx={{ fontWeight: 600 }}>{t('schedules.result')}</TableCell>
-                                </TableRow>
-                              </TableHead>
-                              <TableBody>
-                                {executions[schedule.id]?.map((exec) => (
-                                  <TableRow key={exec.id}>
-                                    <TableCell>{new Date(exec.started_at).toLocaleString()}</TableCell>
-                                    <TableCell>
-                                      <Chip
-                                        label={exec.status}
-                                        size="small"
-                                        color={exec.status === 'success' ? 'success' : 'error'}
-                                        variant="outlined"
-                                      />
-                                    </TableCell>
-                                    <TableCell>{(exec.duration_ms / 1000).toFixed(1)}s</TableCell>
-                                    <TableCell sx={{ maxWidth: 360 }}>
-                                      <Typography
-                                        variant="caption"
-                                        sx={{
-                                          display: 'block',
-                                          overflow: 'hidden',
-                                          textOverflow: 'ellipsis',
-                                          whiteSpace: 'nowrap',
-                                        }}
-                                        title={exec.result || exec.error}
-                                      >
-                                        {exec.result || exec.error}
-                                      </Typography>
-                                    </TableCell>
+                            {executionsLoadingById[schedule.id] && executions[schedule.id] === undefined ? (
+                              <Box display="flex" justifyContent="center" alignItems="center" py={4}>
+                                <CircularProgress size={28} />
+                              </Box>
+                            ) : (
+                              <Table size="small">
+                                <TableHead>
+                                  <TableRow>
+                                    <TableCell sx={{ fontWeight: 600 }}>{t('schedules.startedAt')}</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>{t('schedules.runStatus')}</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>{t('schedules.duration')}</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>{t('schedules.result')}</TableCell>
                                   </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
+                                </TableHead>
+                                <TableBody>
+                                  {(executions[schedule.id] ?? []).map((exec) => (
+                                    <TableRow key={exec.id}>
+                                      <TableCell>{new Date(exec.started_at).toLocaleString()}</TableCell>
+                                      <TableCell>
+                                        <Chip
+                                          label={exec.status}
+                                          size="small"
+                                          color={exec.status === 'success' ? 'success' : 'error'}
+                                          variant="outlined"
+                                        />
+                                      </TableCell>
+                                      <TableCell>{(exec.duration_ms / 1000).toFixed(1)}s</TableCell>
+                                      <TableCell sx={{ maxWidth: 360 }}>
+                                        <Typography
+                                          variant="caption"
+                                          sx={{
+                                            display: 'block',
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                          }}
+                                          title={exec.result || exec.error}
+                                        >
+                                          {exec.result || exec.error}
+                                        </Typography>
+                                      </TableCell>
+                                    </TableRow>
+                                  ))}
+                                </TableBody>
+                              </Table>
+                            )}
                           </Box>
                         </TableCell>
                       </TableRow>
                     )}
                   </React.Fragment>
-                ))}
+                  );
+                })}
                 {filtered.length === 0 && !agentsLoading && (
                   <TableRow>
                     <TableCell colSpan={7} align="center" sx={{ py: 8, border: 'none' }}>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Box,
   Drawer,
@@ -23,6 +23,7 @@ import {
   InputLabel,
   Select,
   MenuItem,
+  Chip,
 } from '@mui/material';
 import {
   Send as SendIcon,
@@ -46,18 +47,49 @@ import {
   closeStream,
   submitToolResultStream,
   flushMessagesAfterToolResult,
+  flushMessagesAfterChatStream,
+  loadClientModeTools,
   clientToolNeedsConfirm,
   getApprovalStatus,
   getPendingApprovalBySession,
+  reconcileDeferredApprovalsFromStorage,
+  saveApprovalDeferredCall,
+  loadApprovalDeferredCall,
+  clearApprovalDeferredCall,
   createStreamingTypewriter,
   finalizeTypewriterAfterStream,
   type StreamingTypewriter,
+  type ReActEvent,
 } from '../api/chat';
 import { TypingIndicator } from '../components/TypingIndicator';
 import { ClientToolIndicator } from '../components/ClientToolIndicator';
+import {
+  PlanExecuteTaskPanel,
+  applyPlanReActEventToRows,
+  type PlanTaskRow,
+} from '../components/PlanExecuteTaskPanel';
+import { invokeBuiltinClientTool, isBuiltinClientToolName } from '../utils/builtinClientTools';
+import { formatClientToolProgressLabel } from '../utils/clientToolProgressLabel';
+import { onChatInputEnterToSend } from '../utils/chatComposer';
+import { useChatScrollToBottom } from '../hooks/useChatScrollToBottom';
+import { userMessageTextToDisplay } from '../utils/chatMessageDisplay';
+import {
+  isGenericStreamFailureText,
+  shouldHideSupersededPlanAssistantBubble,
+  shouldRenderPlanCardForAssistantMessage,
+  shouldHideAssistantBubbleForGenericFailure,
+} from '../utils/chatStreamDisplay';
+import { getPlanExecuteTasksFromReactSteps } from '../utils/hydrateReactStepsPlan';
+import { finalizeStoppedPlanMessages } from '../utils/finalizeStoppedPlan';
+import { markRunningPlanTasksError } from '../utils/planExecuteMerge';
+import { resolveChatAttachmentUrl } from '../api/config';
 import { useTranslation } from 'react-i18next';
+import { Link as RouterLink } from 'react-router-dom';
 
 const sessionRailWidth = 260;
+/** 桌面客户端主聊天：用户气泡单独略窄，助手不变 */
+const CHAT_USER_BUBBLE_MAX_WIDTH = 'min(50%, 400px)';
+const CHAT_ASSISTANT_BUBBLE_MAX_WIDTH = 'min(50%, 372px)';
 
 const ChatPage: React.FC = () => {
   const { t } = useTranslation();
@@ -70,6 +102,9 @@ const ChatPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [streamContent, setStreamContent] = useState('');
+  const [reactSteps, setReactSteps] = useState<ReActEvent[]>([]);
+  const [reactStepsExpanded, setReactStepsExpanded] = useState(true);
+  const [planExecuteTasks, setPlanExecuteTasks] = useState<PlanTaskRow[] | null>(null);
   const [newSessionDialog, setNewSessionDialog] = useState(false);
   const [renameDialog, setRenameDialog] = useState(false);
   const [newTitle, setNewTitle] = useState('');
@@ -78,17 +113,27 @@ const ChatPage: React.FC = () => {
   const [confirmClientTool, setConfirmClientTool] = useState<ClientToolCall | null>(null);
   const [toolResult, setToolResult] = useState('');
   /** Local Tauri tool in progress — use dedicated UI, not TypingIndicator (model streaming). */
-  const [clientToolPhase, setClientToolPhase] = useState<null | 'browser' | 'docker'>(null);
+  const [clientToolPhase, setClientToolPhase] = useState<null | 'system'>(null);
+  const [clientToolName, setClientToolName] = useState<string>('');
+  const [clientToolDetail, setClientToolDetail] = useState<string>('');
   const [approvalPending, setApprovalPending] = useState<{ approvalId: number; toolName: string } | null>(null);
+  const handleApprovalPending = useCallback((approvalId: number, toolName: string) => {
+    setApprovalPending({ approvalId, toolName });
+  }, []);
   const [sessionRailOpen, setSessionRailOpen] = useState(true);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatScrollContainerRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<string | undefined>(undefined);
+  const pendingClientToolAfterApprovalRef = useRef<ClientToolCall | null>(null);
+  const handleClientToolIncomingRef = useRef<(call: ClientToolCall) => void>(() => {});
+  const manuallyStoppedPlanSessionRef = useRef<string | null>(null);
   /** 首次发消息会 createSession → selectedSession 触发 useEffect 拉历史；新会话服务端仍为空会覆盖乐观插入。流结束 onDone 再拉全量。 */
   const deferMessagesFetchUntilStreamDoneRef = useRef<string | null>(null);
   const streamingSessionRef = useRef<string | null>(null);
   const streamTypewriterRef = useRef<StreamingTypewriter | null>(null);
   /** While true, typewriter uses small per-frame steps (matches web useChatPage during SSE). */
   const streamTypingActiveRef = useRef(false);
+  /** True after SSE `client_tool_call` for this turn — next stream [DONE] must not wipe the plan checklist. */
+  const planPauseForClientToolRef = useRef(false);
   const streamTypewriterOpts = useMemo(
     () => ({ streaming: () => streamTypingActiveRef.current }),
     [],
@@ -99,12 +144,12 @@ const ChatPage: React.FC = () => {
   }, [selectedSession]);
 
   useEffect(() => {
-    loadAgents();
+    void loadAgents();
   }, []);
 
   useEffect(() => {
     if (selectedAgent) {
-      loadSessions();
+      void loadSessions();
     }
   }, [selectedAgent]);
 
@@ -117,32 +162,107 @@ const ChatPage: React.FC = () => {
   }, [selectedSession]);
 
   useEffect(() => {
-    if (!selectedSession?.session_id || approvalPending) return;
-    const checkPendingApproval = async () => {
+    const syncDeferredApprovals = async () => {
+      const sid = selectedSession?.session_id ?? sessionIdRef.current;
+      if (!sid?.trim()) return;
       try {
-        const pending = await getPendingApprovalBySession(selectedSession.session_id);
+        const r = await reconcileDeferredApprovalsFromStorage(sid);
+        if (r.type === 'run_approved') {
+          pendingClientToolAfterApprovalRef.current = null;
+          setApprovalPending(null);
+          const { approval_id: _a, skip_local_confirm: _s, ...rest } = r.call;
+          handleClientToolIncomingRef.current({
+            ...(rest as ClientToolCall),
+            skip_local_confirm: true,
+          });
+          return;
+        }
+        if (r.type === 'still_pending') {
+          pendingClientToolAfterApprovalRef.current = r.deferred;
+          setApprovalPending({ approvalId: r.approvalId, toolName: r.toolName });
+          return;
+        }
+
+        const pending = await getPendingApprovalBySession(sid);
         if (pending) {
+          const restored = loadApprovalDeferredCall(sid, pending.id);
+          if (restored?.call_id?.trim()) {
+            pendingClientToolAfterApprovalRef.current = restored;
+          }
           setApprovalPending({ approvalId: pending.id, toolName: pending.tool_name });
         }
       } catch (err) {
-        console.error('Failed to check pending approval:', err);
+        console.error('Failed to sync deferred approvals:', err);
       }
     };
-    checkPendingApproval();
-  }, [selectedSession]);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, streamContent, streaming, clientToolPhase, approvalPending]);
+    void syncDeferredApprovals();
+
+    const onFocus = () => {
+      void syncDeferredApprovals();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void syncDeferredApprovals();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [selectedSession?.session_id]);
+
+  useChatScrollToBottom(
+    chatScrollContainerRef,
+    [
+      messages,
+      streamContent,
+      streaming,
+      clientToolPhase,
+      approvalPending,
+      planExecuteTasks,
+      reactSteps,
+      reactStepsExpanded,
+    ],
+    'ChatPage',
+    () => ({
+      messagesLen: messages.length,
+      streamLen: streamContent.length,
+      planLen: planExecuteTasks?.length ?? 0,
+      reactStepsLen: reactSteps.length,
+      reactStepsExpanded,
+    }),
+  );
 
   useEffect(() => {
     if (!approvalPending) return;
     const pollApproval = async () => {
       try {
         const status = await getApprovalStatus(approvalPending.approvalId);
+        const ap = approvalPending;
+        const sid = selectedSession?.session_id ?? sessionIdRef.current;
         if (status.status === 'approved') {
+          let deferred = pendingClientToolAfterApprovalRef.current;
+          if ((!deferred || !deferred.call_id?.trim()) && sid) {
+            const restored = loadApprovalDeferredCall(sid, ap.approvalId);
+            if (restored?.call_id?.trim()) {
+              deferred = restored;
+              pendingClientToolAfterApprovalRef.current = restored;
+            }
+          }
+          if (deferred && ap && Number(deferred.approval_id) === Number(ap.approvalId)) {
+            if (sid) clearApprovalDeferredCall(sid, ap.approvalId);
+            pendingClientToolAfterApprovalRef.current = null;
+            setApprovalPending(null);
+            const { approval_id: _aid, skip_local_confirm: _sk, ...withoutApproval } = deferred;
+            handleClientToolIncomingRef.current({
+              ...(withoutApproval as ClientToolCall),
+              skip_local_confirm: true,
+            });
+            return;
+          }
+          if (sid) clearApprovalDeferredCall(sid, ap.approvalId);
           setApprovalPending(null);
-          const sid = selectedSession?.session_id ?? sessionIdRef.current;
           if (sid) {
             setLoading(false);
             setStreaming(false);
@@ -150,19 +270,35 @@ const ChatPage: React.FC = () => {
             void loadMessages({ silent: true, sessionId: sid });
           }
         } else if (status.status === 'rejected') {
+          if (sid) clearApprovalDeferredCall(sid, ap.approvalId);
+          if (pendingClientToolAfterApprovalRef.current?.approval_id === approvalPending?.approvalId) {
+            pendingClientToolAfterApprovalRef.current = null;
+          }
           setApprovalPending(null);
-          setError(`审批被拒绝: ${status.comment || ''}`);
+          setError(t('agentDetail.approvalRejected', { comment: status.comment || '—' }));
         } else if (status.status === 'expired') {
+          if (sid) clearApprovalDeferredCall(sid, ap.approvalId);
+          if (pendingClientToolAfterApprovalRef.current?.approval_id === approvalPending?.approvalId) {
+            pendingClientToolAfterApprovalRef.current = null;
+          }
           setApprovalPending(null);
-          setError('审批已过期，请重新发起请求');
+          setError(t('agentDetail.approvalExpired'));
         }
       } catch (err) {
         console.error('Failed to poll approval status:', err);
       }
     };
-    const interval = setInterval(pollApproval, 20000);
-    return () => clearInterval(interval);
-  }, [approvalPending]);
+    void pollApproval();
+    const interval = window.setInterval(pollApproval, 2500);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void pollApproval();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [approvalPending, t]);
 
   const loadAgents = async () => {
     try {
@@ -196,7 +332,9 @@ const ChatPage: React.FC = () => {
     }
     try {
       const data = await getSessionMessages(sid);
-      setMessages(data);
+      setMessages(
+        manuallyStoppedPlanSessionRef.current === sid ? finalizeStoppedPlanMessages(data) : data,
+      );
     } catch {
       setError('Failed to load messages');
     } finally {
@@ -206,123 +344,149 @@ const ChatPage: React.FC = () => {
     }
   };
 
+  const mergeStreamReActEvent = useCallback((event: ReActEvent) => {
+    if (!event) return;
+    setPlanExecuteTasks((prev) => applyPlanReActEventToRows(prev, event));
+    if (event.type === 'plan_tasks' || event.type === 'plan_step') {
+      return;
+    }
+    if (
+      event.type === 'thought' ||
+      event.type === 'action' ||
+      event.type === 'observation' ||
+      event.type === 'reflection'
+    ) {
+      setReactSteps((prev) => [...prev, event]);
+    } else if (event.type === 'final_answer') {
+      setReactSteps([]);
+    }
+  }, []);
+
+  /** Call when any chat/tool_result SSE finishes with [DONE]. Preserves plan rows if stream paused for client tool. */
+  const clearPlanAfterStreamFinish = useCallback(() => {
+    if (!planPauseForClientToolRef.current) {
+      setPlanExecuteTasks(null);
+    } else {
+      planPauseForClientToolRef.current = false;
+    }
+  }, []);
+
   const handleClientToolIncoming = (call: ClientToolCall): void => {
     const sid = selectedSession?.session_id ?? sessionIdRef.current;
     if (!sid?.trim() || !call.call_id?.trim()) return;
+    planPauseForClientToolRef.current = true;
+    if (call.approval_id != null && call.approval_id > 0) {
+      pendingClientToolAfterApprovalRef.current = call;
+      saveApprovalDeferredCall(sid, call);
+      setApprovalPending({ approvalId: call.approval_id, toolName: call.tool_name });
+      return;
+    }
     setStreaming(false);
     streamTypingActiveRef.current = false;
     setLoading(false);
     setClientToolPhase(null);
+    setClientToolName('');
+    setClientToolDetail('');
     streamTypewriterRef.current?.reset();
     streamTypewriterRef.current = null;
     setStreamContent('');
     streamingSessionRef.current = null;
-    const needsConfirm = clientToolNeedsConfirm(call.risk_level, call.execution_mode);
-    console.log('[DEBUG] handleClientToolIncoming:', { call, needsConfirm });
-
-    const runDockerWithTauri = (): void => {
-      void (async () => {
-        setClientToolPhase('docker');
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const out = await invoke<string>('run_client_docker_operator', { params: call.params });
-          setClientToolPhase(null);
-          setStreaming(true);
-          streamTypingActiveRef.current = true;
-          streamTypewriterRef.current?.reset();
-          streamTypewriterRef.current = createStreamingTypewriter(setStreamContent, streamTypewriterOpts);
-          submitToolResultStream(
-            sid,
-            call.call_id,
-            out,
-            undefined,
-            (c) => streamTypewriterRef.current?.push(c),
-            (doneSid) => {
-              finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
-                setStreaming(false);
-                setStreamContent('');
-                if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
-              });
-            },
-            (e) => {
-              streamTypingActiveRef.current = false;
-              streamTypewriterRef.current?.reset();
-              streamTypewriterRef.current = null;
-              setStreaming(false);
-              setClientToolPhase(null);
-              setError(e.message);
-            },
-            handleClientToolIncoming,
-          );
-        } catch (e) {
-          setClientToolPhase(null);
-          console.error('[ChatPage] run_client_docker_operator failed', e);
-          setError(e instanceof Error ? e.message : String(e));
-          setClientToolCall(call);
-          setToolResult('');
-        }
-      })();
-    };
-
-    const runBrowserWithTauri = (): void => {
-      void (async () => {
-        setClientToolPhase('browser');
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const out = await invoke<string>('run_client_browser', { params: call.params });
-          setClientToolPhase(null);
-          setStreaming(true);
-          streamTypingActiveRef.current = true;
-          streamTypewriterRef.current?.reset();
-          streamTypewriterRef.current = createStreamingTypewriter(setStreamContent, streamTypewriterOpts);
-          submitToolResultStream(
-            sid,
-            call.call_id,
-            out,
-            undefined,
-            (c) => streamTypewriterRef.current?.push(c),
-            (doneSid) => {
-              finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
-                setStreaming(false);
-                setStreamContent('');
-                if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
-              });
-            },
-            (e) => {
-              streamTypingActiveRef.current = false;
-              streamTypewriterRef.current?.reset();
-              streamTypewriterRef.current = null;
-              setStreaming(false);
-              setClientToolPhase(null);
-              setError(e.message);
-            },
-            handleClientToolIncoming,
-          );
-        } catch (e) {
-          setClientToolPhase(null);
-          console.error('[ChatPage] run_client_browser failed', e);
-          setError(e instanceof Error ? e.message : String(e));
-          setClientToolCall(call);
-          setToolResult('');
-        }
-      })();
-    };
-
-    if (call.tool_name === 'builtin_docker_operator') {
-      if (needsConfirm) {
-        setConfirmClientTool(call);
-        return;
-      }
-      runDockerWithTauri();
-      return;
+    const needsConfirm =
+      !call.skip_local_confirm && clientToolNeedsConfirm(call.risk_level, call.execution_mode);
+    if (import.meta.env.DEV) {
+      console.debug('[handleClientToolIncoming]', { call, needsConfirm });
     }
 
-    if (call.tool_name === 'builtin_browser') {
+    const runBuiltinClientTool = (toolName: string): void => {
+      setClientToolPhase('system');
+      setClientToolName(toolName.replace('builtin_', ''));
+      setClientToolDetail(formatClientToolProgressLabel(toolName, call.params as Record<string, unknown>));
+      void (async () => {
+        try {
+          const out = await invokeBuiltinClientTool(toolName, call.params as Record<string, unknown>);
+          setClientToolPhase(null);
+          setClientToolName('');
+          setClientToolDetail('');
+          setStreaming(true);
+          streamTypingActiveRef.current = true;
+          streamTypewriterRef.current?.reset();
+          streamTypewriterRef.current = createStreamingTypewriter(setStreamContent, streamTypewriterOpts);
+          submitToolResultStream(
+            sid,
+            call.call_id,
+            out,
+            undefined,
+            (c) => streamTypewriterRef.current?.push(c),
+            (doneSid) => {
+              finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
+                setStreaming(false);
+                setStreamContent('');
+                clearPlanAfterStreamFinish();
+                if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
+              });
+            },
+            (e) => {
+              streamTypingActiveRef.current = false;
+              streamTypewriterRef.current?.reset();
+              streamTypewriterRef.current = null;
+              setStreaming(false);
+              setClientToolPhase(null);
+              setClientToolName('');
+              setClientToolDetail('');
+              setError(e.message);
+            },
+            handleClientToolIncoming,
+            handleApprovalPending,
+            mergeStreamReActEvent,
+          );
+        } catch (e) {
+          setClientToolPhase(null);
+          setClientToolName('');
+          setClientToolDetail('');
+          const toolFailMsg = e instanceof Error ? e.message : String(e);
+          console.error(`[ChatPage] builtin client tool failed: ${toolName}`, e);
+          setStreaming(true);
+          streamTypingActiveRef.current = true;
+          streamTypewriterRef.current?.reset();
+          streamTypewriterRef.current = createStreamingTypewriter(setStreamContent, streamTypewriterOpts);
+          submitToolResultStream(
+            sid,
+            call.call_id,
+            '',
+            toolFailMsg,
+            (c) => streamTypewriterRef.current?.push(c),
+            (doneSid) => {
+              finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
+                setStreaming(false);
+                setStreamContent('');
+                clearPlanAfterStreamFinish();
+                if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
+              });
+            },
+              (err) => {
+              streamTypingActiveRef.current = false;
+              streamTypewriterRef.current?.reset();
+              streamTypewriterRef.current = null;
+              setStreaming(false);
+              setClientToolPhase(null);
+              setClientToolName('');
+              setClientToolDetail('');
+              setError(err.message);
+            },
+            handleClientToolIncoming,
+            handleApprovalPending,
+            mergeStreamReActEvent,
+          );
+        }
+      })();
+    };
+
+    if (isBuiltinClientToolName(call.tool_name)) {
       if (needsConfirm) {
         setConfirmClientTool(call);
         return;
       }
-      runBrowserWithTauri();
+      runBuiltinClientTool(call.tool_name);
       return;
     }
 
@@ -344,13 +508,16 @@ const ChatPage: React.FC = () => {
       return;
     }
 
-    if (call.tool_name === 'builtin_docker_operator') {
+    const confirmRunBuiltinClientTool = (toolName: string): void => {
       void (async () => {
-        setClientToolPhase('docker');
+        setClientToolPhase('system');
+        setClientToolName(toolName.replace('builtin_', ''));
+        setClientToolDetail(formatClientToolProgressLabel(toolName, call.params as Record<string, unknown>));
         try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const out = await invoke<string>('run_client_docker_operator', { params: call.params });
+          const out = await invokeBuiltinClientTool(toolName, call.params as Record<string, unknown>);
           setClientToolPhase(null);
+          setClientToolName('');
+          setClientToolDetail('');
           setStreaming(true);
           streamTypingActiveRef.current = true;
           streamTypewriterRef.current?.reset();
@@ -365,6 +532,7 @@ const ChatPage: React.FC = () => {
               finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
                 setStreaming(false);
                 setStreamContent('');
+                clearPlanAfterStreamFinish();
                 if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
               });
             },
@@ -374,24 +542,20 @@ const ChatPage: React.FC = () => {
               streamTypewriterRef.current = null;
               setStreaming(false);
               setClientToolPhase(null);
+              setClientToolName('');
+              setClientToolDetail('');
               setError(e.message);
             },
             handleClientToolIncoming,
+            handleApprovalPending,
+            mergeStreamReActEvent,
           );
         } catch (e) {
           setClientToolPhase(null);
-          console.error('[ChatPage] run_client_docker_operator failed', e);
-          setClientToolCall(call);
-          setToolResult('');
-        }
-      })();
-    } else if (call.tool_name === 'builtin_browser') {
-      void (async () => {
-        setClientToolPhase('browser');
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const out = await invoke<string>('run_client_browser', { params: call.params });
-          setClientToolPhase(null);
+          setClientToolName('');
+          setClientToolDetail('');
+          const toolFailMsg = e instanceof Error ? e.message : String(e);
+          console.error(`[ChatPage] confirm builtin client tool failed: ${toolName}`, e);
           setStreaming(true);
           streamTypingActiveRef.current = true;
           streamTypewriterRef.current?.reset();
@@ -399,37 +563,96 @@ const ChatPage: React.FC = () => {
           submitToolResultStream(
             sid,
             call.call_id,
-            out,
-            undefined,
+            '',
+            toolFailMsg,
             (c) => streamTypewriterRef.current?.push(c),
             (doneSid) => {
               finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
                 setStreaming(false);
                 setStreamContent('');
+                clearPlanAfterStreamFinish();
                 if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
               });
             },
-            (e) => {
+              (err) => {
               streamTypingActiveRef.current = false;
               streamTypewriterRef.current?.reset();
               streamTypewriterRef.current = null;
               setStreaming(false);
               setClientToolPhase(null);
-              setError(e.message);
+              setClientToolName('');
+              setClientToolDetail('');
+              setError(err.message);
             },
             handleClientToolIncoming,
+            handleApprovalPending,
+            mergeStreamReActEvent,
           );
-        } catch (e) {
-          setClientToolPhase(null);
-          console.error('[ChatPage] run_client_browser failed', e);
-          setClientToolCall(call);
-          setToolResult('');
         }
       })();
+    };
+
+    if (isBuiltinClientToolName(call.tool_name)) {
+      confirmRunBuiltinClientTool(call.tool_name);
     } else {
       setClientToolCall(call);
       setToolResult('');
     }
+  };
+
+  const submitClientToolCancelled = (call: ClientToolCall | null): void => {
+    setError('');
+    if (!call?.call_id?.trim()) return;
+    const sid = selectedSession?.session_id ?? sessionIdRef.current;
+    if (!sid?.trim()) {
+      setError(t('errors.sessionOrCallMissing'));
+      return;
+    }
+    const cancelText = t('agentDetail.clientToolCancelledByUser');
+    setPlanExecuteTasks((prev) => markRunningPlanTasksError(prev, cancelText));
+    setStreaming(true);
+    streamTypingActiveRef.current = true;
+    streamTypewriterRef.current?.reset();
+    streamTypewriterRef.current = createStreamingTypewriter(setStreamContent, streamTypewriterOpts);
+    submitToolResultStream(
+      sid,
+      call.call_id,
+      '',
+      cancelText,
+      (c) => streamTypewriterRef.current?.push(c),
+      (doneSid) => {
+        finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
+          setStreaming(false);
+          setStreamContent('');
+          planPauseForClientToolRef.current = false;
+          if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
+        });
+      },
+      (e) => {
+        streamTypingActiveRef.current = false;
+        streamTypewriterRef.current?.reset();
+        streamTypewriterRef.current = null;
+        setStreaming(false);
+        setStreamContent('');
+        setError(e.message);
+      },
+      handleClientToolIncoming,
+      handleApprovalPending,
+      mergeStreamReActEvent,
+    );
+  };
+
+  const dismissConfirmClientTool = (): void => {
+    const call = confirmClientTool;
+    setConfirmClientTool(null);
+    submitClientToolCancelled(call);
+  };
+
+  const dismissPasteClientTool = (): void => {
+    const call = clientToolCall;
+    setClientToolCall(null);
+    setToolResult('');
+    submitClientToolCancelled(call);
   };
 
   const handleNewSession = async () => {
@@ -480,6 +703,9 @@ const ChatPage: React.FC = () => {
     const userMessage = input.trim();
     setInput('');
     setError('');
+    manuallyStoppedPlanSessionRef.current = null;
+    planPauseForClientToolRef.current = false;
+    setPlanExecuteTasks(null);
 
     let currentSessionId = selectedSession?.session_id;
 
@@ -519,11 +745,13 @@ const ChatPage: React.FC = () => {
     streamingSessionRef.current = currentSessionId;
 
     try {
+      await loadClientModeTools();
       streamChatMessage(
         { agent_id: selectedAgent.id, message: userMessage, session_id: currentSessionId },
         (content) => {
           streamTypewriterRef.current?.push(content);
         },
+        mergeStreamReActEvent,
         (sessionId) => {
           const sid = sessionId || streamingSessionRef.current || undefined;
           streamingSessionRef.current = null;
@@ -531,11 +759,13 @@ const ChatPage: React.FC = () => {
             setStreaming(false);
             setLoading(false);
             setStreamContent('');
+            setReactSteps([]);
+            clearPlanAfterStreamFinish();
             if (sid) {
               if (deferMessagesFetchUntilStreamDoneRef.current === sid) {
                 deferMessagesFetchUntilStreamDoneRef.current = null;
               }
-              void loadMessages({ silent: true, sessionId: sid });
+              flushMessagesAfterChatStream(loadMessages, sid);
             }
           });
         },
@@ -547,18 +777,18 @@ const ChatPage: React.FC = () => {
           streamTypewriterRef.current = null;
           setStreaming(false);
           setLoading(false);
-          setError(err.message);
+          planPauseForClientToolRef.current = false;
+          setPlanExecuteTasks(null);
+          setError(err?.message || String(err));
           if (sid) {
             if (deferMessagesFetchUntilStreamDoneRef.current === sid) {
               deferMessagesFetchUntilStreamDoneRef.current = null;
             }
-            void loadMessages({ silent: true, sessionId: sid });
+            flushMessagesAfterChatStream(loadMessages, sid);
           }
         },
         handleClientToolIncoming,
-        (approvalId, toolName) => {
-          setApprovalPending({ approvalId, toolName });
-        },
+        handleApprovalPending,
       );
     } catch (err: any) {
       const sid = streamingSessionRef.current ?? undefined;
@@ -568,11 +798,13 @@ const ChatPage: React.FC = () => {
       streamTypewriterRef.current = null;
       setStreaming(false);
       setLoading(false);
+      planPauseForClientToolRef.current = false;
+      setPlanExecuteTasks(null);
       if (sid) {
         if (deferMessagesFetchUntilStreamDoneRef.current === sid) {
           deferMessagesFetchUntilStreamDoneRef.current = null;
         }
-        void loadMessages({ silent: true, sessionId: sid });
+        flushMessagesAfterChatStream(loadMessages, sid);
       }
       setError(err.message);
     }
@@ -582,6 +814,7 @@ const ChatPage: React.FC = () => {
     const sid = streamingSessionRef.current ?? selectedSession?.session_id;
     try {
       if (sid) {
+        manuallyStoppedPlanSessionRef.current = sid;
         await stopChatStream(sid);
       } else {
         closeStream();
@@ -596,11 +829,13 @@ const ChatPage: React.FC = () => {
       setStreaming(false);
       setLoading(false);
       setStreamContent('');
+      planPauseForClientToolRef.current = false;
+      setPlanExecuteTasks(null);
       if (sid) {
         if (deferMessagesFetchUntilStreamDoneRef.current === sid) {
           deferMessagesFetchUntilStreamDoneRef.current = null;
         }
-        void loadMessages({ silent: true, sessionId: sid });
+        flushMessagesAfterChatStream(loadMessages, sid);
       }
     }
   };
@@ -626,6 +861,7 @@ const ChatPage: React.FC = () => {
         finalizeTypewriterAfterStream(streamTypewriterRef, streamTypingActiveRef, () => {
           setStreaming(false);
           setStreamContent('');
+          clearPlanAfterStreamFinish();
           if (doneSid) flushMessagesAfterToolResult(loadMessages, doneSid);
         });
       },
@@ -635,17 +871,20 @@ const ChatPage: React.FC = () => {
         streamTypewriterRef.current = null;
         setStreaming(false);
         setLoading(false);
+        planPauseForClientToolRef.current = false;
+        setPlanExecuteTasks(null);
         setError(e.message);
       },
       handleClientToolIncoming,
+      handleApprovalPending,
+      mergeStreamReActEvent,
     );
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
+  handleClientToolIncomingRef.current = handleClientToolIncoming;
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    onChatInputEnterToSend(e, handleSend);
   };
 
   return (
@@ -776,24 +1015,149 @@ const ChatPage: React.FC = () => {
             </Alert>
           )}
 
-          <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>
-            {messages.map((msg) => (
+          {/* ReAct 推理步骤显示 - 可折叠 */}
+          {reactSteps.length > 0 && (
+            <Paper
+              elevation={0}
+              sx={{ mb: 2, p: 1, bgcolor: 'grey.100', borderRadius: 1 }}
+            >
+              <Box
+                sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', userSelect: 'none' }}
+                onClick={() => setReactStepsExpanded(!reactStepsExpanded)}
+              >
+                <Typography variant="caption" sx={{ fontWeight: 600, flex: 1 }}>
+                  🤖 Thinking ({reactSteps.length} steps)
+                </Typography>
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {reactStepsExpanded ? '▼' : '▶'}
+                </Typography>
+              </Box>
+              {reactStepsExpanded && (
+                <Box sx={{ mt: 1, maxHeight: 300, overflow: 'auto' }}>
+                  {reactSteps.map((step, idx) => (
+                    <Box key={idx} sx={{ mb: 1, pl: 1, borderLeft: '2px solid', borderColor: step.type === 'action' ? 'primary.main' : step.type === 'observation' ? 'success.main' : 'grey.400' }}>
+                      <Typography variant="caption" sx={{ fontWeight: 500, color: step.type === 'action' ? 'primary.main' : step.type === 'observation' ? 'success.main' : 'text.secondary' }}>
+                        {step.type === 'thought' ? '💭' : step.type === 'action' ? '🔧' : step.type === 'observation' ? '📊' : '🔄'}
+                        {step.step && `[${step.step}] `}{step.type}
+                        {step.tool && ` (${step.tool})`}
+                      </Typography>
+                      <Typography variant="caption" component="pre" sx={{ display: 'block', whiteSpace: 'pre-wrap', fontSize: 11, color: 'text.secondary', mt: 0.5 }}>
+                        {step.content.length > 200 ? step.content.slice(0, 200) + '...' : step.content}
+                      </Typography>
+                    </Box>
+                  ))}
+                </Box>
+              )}
+            </Paper>
+          )}
+
+          <Box ref={chatScrollContainerRef} sx={{ flex: 1, overflow: 'auto', p: 2 }}>
+            {messages
+              .map((msg, idx) => ({ msg, idx }))
+              .filter(
+                (x) => {
+                  if (
+                    streaming &&
+                    (planExecuteTasks?.length ?? 0) > 0 &&
+                    x.msg.role === 'assistant' &&
+                    shouldRenderPlanCardForAssistantMessage(x.msg, x.idx, messages) &&
+                    getPlanExecuteTasksFromReactSteps(x.msg.react_steps).length > 0 &&
+                    isGenericStreamFailureText(x.msg.content)
+                  ) {
+                    return false;
+                  }
+                  return (
+                    !shouldHideAssistantBubbleForGenericFailure(x.msg, x.idx, messages) &&
+                    !shouldHideSupersededPlanAssistantBubble(x.msg, x.idx, messages)
+                  );
+                },
+              )
+              .map(({ msg, idx }) => (
               <Paper
                 key={msg.id}
                 elevation={0}
                 sx={{
                   p: 2,
                   mb: 2,
-                  maxWidth: '80%',
+                  maxWidth:
+                    msg.role === 'user' ? CHAT_USER_BUBBLE_MAX_WIDTH : CHAT_ASSISTANT_BUBBLE_MAX_WIDTH,
                   ml: msg.role === 'user' ? 'auto' : 0,
                   mr: msg.role === 'user' ? 0 : 'auto',
                   bgcolor: msg.role === 'user' ? 'primary.main' : 'background.paper',
                   color: msg.role === 'user' ? 'primary.contrastText' : 'text.primary',
                 }}
               >
-                <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
-                  {msg.content}
-                </Typography>
+                {msg.role === 'user' && msg.image_urls?.filter((u) => u && String(u).trim()).length ? (
+                  <Box sx={{ display: 'flex', gap: 1, mb: 1, flexWrap: 'wrap' }}>
+                    {msg.image_urls.filter((u) => u && String(u).trim()).map((url, idx) => {
+                      const src = resolveChatAttachmentUrl(url);
+                      return (
+                        <Box
+                          key={idx}
+                          component="img"
+                          src={src}
+                          alt=""
+                          sx={{
+                            display: 'block',
+                            maxWidth: 'min(100%, 220px)',
+                            maxHeight: 140,
+                            objectFit: 'contain',
+                            borderRadius: 1,
+                          }}
+                        />
+                      );
+                    })}
+                  </Box>
+                ) : null}
+                {msg.role === 'user' && msg.file_urls && msg.file_urls.length > 0 ? (
+                  <Box sx={{ display: 'flex', gap: 1, mb: 1, flexWrap: 'wrap' }}>
+                    {msg.file_urls.map((url, idx) => (
+                      <Chip
+                        key={idx}
+                        label={url.split('/').pop()}
+                        size="small"
+                        variant="outlined"
+                        sx={{
+                          bgcolor: msg.role === 'user' ? 'rgba(0,0,0,0.12)' : 'background.paper',
+                          borderColor: msg.role === 'user' ? 'rgba(255,255,255,0.35)' : 'divider',
+                        }}
+                      />
+                    ))}
+                  </Box>
+                ) : null}
+                {msg.role === 'assistant' ? (
+                  <>
+                    {(() => {
+                      const planFromHistory = getPlanExecuteTasksFromReactSteps(msg.react_steps);
+                      const showPlanCard =
+                        shouldRenderPlanCardForAssistantMessage(msg, idx, messages) &&
+                        !(streaming && (planExecuteTasks?.length ?? 0) > 0);
+                      const hideAssistantText =
+                        isGenericStreamFailureText(msg.content) && planFromHistory.length > 0;
+                      return (
+                        <>
+                          {showPlanCard && planFromHistory.length > 0 && (
+                            <Box sx={{ mb: 1.5, width: '100%' }}>
+                              <PlanExecuteTaskPanel
+                                tasks={planFromHistory}
+                                title={t('agentDetail.planExecuteTaskList')}
+                              />
+                            </Box>
+                          )}
+                          {!hideAssistantText ? (
+                            <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+                              {msg.content}
+                            </Typography>
+                          ) : null}
+                        </>
+                      );
+                    })()}
+                  </>
+                ) : (
+                  <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+                    {userMessageTextToDisplay(msg, t)}
+                  </Typography>
+                )}
               </Paper>
             ))}
 
@@ -803,7 +1167,7 @@ const ChatPage: React.FC = () => {
                 sx={{
                   p: 2,
                   mb: 2,
-                  maxWidth: '80%',
+                  maxWidth: CHAT_ASSISTANT_BUBBLE_MAX_WIDTH,
                   mr: 'auto',
                   bgcolor: 'background.paper',
                   border: '1px solid',
@@ -811,38 +1175,54 @@ const ChatPage: React.FC = () => {
                 }}
               >
                 <ClientToolIndicator
-                  kind={clientToolPhase}
-                  label={
-                    clientToolPhase === 'browser'
-                      ? t('agentDetail.localToolBrowserRunning')
-                      : t('agentDetail.localToolDockerRunning')
-                  }
+                  kind="system"
+                  label={t('agentDetail.localToolRunning')}
+                  toolName={clientToolName}
+                  detail={clientToolDetail || undefined}
                 />
               </Paper>
             )}
 
             {streaming && (
-              <Paper
-                elevation={0}
+              <Box
                 sx={{
-                  p: 2,
                   mb: 2,
-                  maxWidth: '80%',
+                  maxWidth: CHAT_ASSISTANT_BUBBLE_MAX_WIDTH,
                   mr: 'auto',
-                  bgcolor: 'background.paper',
+                  width: '100%',
                 }}
               >
-                {!streamContent.trim() ? (
-                  <TypingIndicator />
-                ) : (
-                  <>
-                    <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
-                      {streamContent}
-                    </Typography>
-                    <CircularProgress size={16} sx={{ mt: 1 }} />
-                  </>
+                {planExecuteTasks && planExecuteTasks.length > 0 && (
+                  <PlanExecuteTaskPanel tasks={planExecuteTasks} title={t('agentDetail.planExecuteTaskList')} />
                 )}
-              </Paper>
+                <Paper
+                  elevation={0}
+                  sx={{
+                    p: 2,
+                    maxWidth: CHAT_ASSISTANT_BUBBLE_MAX_WIDTH,
+                    mr: 'auto',
+                    bgcolor: 'background.paper',
+                  }}
+                >
+                  {(() => {
+                    // 流式阶段若主文本仅为服务端占位「抱歉…」，用打字动画代替（含 ReAct 无 plan 时）；避免先闪错误再被成功回复顶掉。
+                    const effectiveStream =
+                      streaming && isGenericStreamFailureText(streamContent.trim())
+                        ? ''
+                        : streamContent;
+                    return !effectiveStream.trim() ? (
+                      <TypingIndicator />
+                    ) : (
+                      <>
+                        <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+                          {effectiveStream}
+                        </Typography>
+                        <CircularProgress size={16} sx={{ mt: 1 }} />
+                      </>
+                    );
+                  })()}
+                </Paper>
+              </Box>
             )}
 
             {!messages.length && !streaming && !clientToolPhase && (
@@ -853,12 +1233,28 @@ const ChatPage: React.FC = () => {
               </Box>
             )}
 
-            <div ref={messagesEndRef} />
           </Box>
 
           {approvalPending && (
-            <Alert severity="info" sx={{ m: 2 }}>
-              正在审批中，请稍候... (工具: {approvalPending.toolName}, 审批ID: {approvalPending.approvalId})
+            <Alert
+              severity="info"
+              sx={{ m: 2 }}
+              action={
+                <Button
+                  component={RouterLink}
+                  to="/approvals"
+                  size="small"
+                  color="inherit"
+                  sx={{ textTransform: 'none' }}
+                >
+                  {t('agentDetail.openApprovalsPage')}
+                </Button>
+              }
+            >
+              {t('agentDetail.approvalPendingBanner', {
+                tool: approvalPending.toolName,
+                id: approvalPending.approvalId,
+              })}
             </Alert>
           )}
 
@@ -922,33 +1318,56 @@ const ChatPage: React.FC = () => {
         </DialogActions>
       </Dialog>
 
-      <Dialog open={!!confirmClientTool} onClose={() => setConfirmClientTool(null)} maxWidth="sm" fullWidth>
-        <DialogTitle>确认本地执行</DialogTitle>
+      <Dialog
+        open={!!confirmClientTool}
+        onClose={(_e, reason) => {
+          if (reason === 'backdropClick' || reason === 'escapeKeyDown') {
+            dismissConfirmClientTool();
+          }
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>{t('agentDetail.confirmLocalExecution')}</DialogTitle>
         <DialogContent>
           <Typography variant="body2" sx={{ mb: 1 }}>
-            工具 <strong>{confirmClientTool?.tool_name}</strong> 的风险级别为{' '}
-            <strong>{confirmClientTool?.risk_level || 'medium'}</strong>
+            {t('agentDetail.clientToolRiskLine', {
+              tool: confirmClientTool?.tool_name ?? '',
+              risk: confirmClientTool?.risk_level || 'medium',
+            })}
             {confirmClientTool?.tool_name === 'builtin_docker_operator'
-              ? '，确认后将在本机执行 docker（白名单只读操作）。'
+              ? t('agentDetail.dockerConfirmSuffix')
               : confirmClientTool?.tool_name === 'builtin_browser'
-                ? '，确认后将在本机连接并驱动可见的 Chrome/Chromium 窗口执行自动化。'
-                : '，确认后请在下个对话框中粘贴本地执行结果。'}
+                ? t('agentDetail.browserConfirmSuffix')
+                : t('agentDetail.pasteResultSuffix')}
           </Typography>
           {confirmClientTool?.hint && (
             <Typography variant="caption" color="text.secondary" display="block">
               {confirmClientTool.hint}
             </Typography>
           )}
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>
+            {t('agentDetail.clientToolLocalVsApprovalHint')}
+          </Typography>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setConfirmClientTool(null)}>取消</Button>
+          <Button onClick={dismissConfirmClientTool}>{t('agentDetail.cancel')}</Button>
           <Button onClick={handleConfirmRiskyClientTool} variant="contained">
-            确认
+            {t('agentDetail.confirm')}
           </Button>
         </DialogActions>
       </Dialog>
 
-      <Dialog open={!!clientToolCall} onClose={() => setClientToolCall(null)} maxWidth="md" fullWidth>
+      <Dialog
+        open={!!clientToolCall}
+        onClose={(_e, reason) => {
+          if (reason === 'backdropClick' || reason === 'escapeKeyDown') {
+            dismissPasteClientTool();
+          }
+        }}
+        maxWidth="md"
+        fullWidth
+      >
         <DialogTitle>Client Tool Call: {clientToolCall?.tool_name}</DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
@@ -968,7 +1387,7 @@ const ChatPage: React.FC = () => {
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setClientToolCall(null)}>Cancel</Button>
+          <Button onClick={dismissPasteClientTool}>Cancel</Button>
           <Button onClick={handleToolCallSubmit} variant="contained">
             Submit Result
           </Button>

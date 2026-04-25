@@ -1,5 +1,16 @@
+import { unstable_batchedUpdates } from 'react-dom';
 import { getApiUrl } from './config';
+import { GENERIC_STREAM_FAILURE_ZH } from '../utils/chatStreamDisplay';
 import type { ChatRequest, ChatResponse, ChatSession, ChatHistoryMessage, Agent, ClientToolCall } from '../types';
+
+/** True only when assistant text is exactly the server placeholder line (not empty). */
+function isExactGenericStreamFailureZh(s: string): boolean {
+  const t = String(s ?? '')
+    .replace(/\s+/g, '')
+    .trim();
+  if (t === '') return false;
+  return t === GENERIC_STREAM_FAILURE_ZH.replace(/\s+/g, '');
+}
 
 /** AbortController for the active POST /chat/stream body reader (EventSource cannot do POST + Bearer). */
 let currentStreamAbort: AbortController | null = null;
@@ -41,12 +52,25 @@ export function isClientModeTool(toolName: string): boolean {
     console.warn('[isClientModeTool] client mode tools not loaded yet');
     return false;
   }
-  return clientModeToolsCache.has(toolName);
+  if (clientModeToolsCache.has(toolName)) {
+    return true;
+  }
+  // /skills returns keys like builtin_skill.datetime; SSE tool_call uses builtin_datetime
+  if (toolName.startsWith('builtin_') && !toolName.startsWith('builtin_skill.')) {
+    const asSkillKey = `builtin_skill.${toolName.replace(/^builtin_/, '')}`;
+    if (clientModeToolsCache.has(asSkillKey)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
- * Tauri / desktop: confirm when the tool runs on the client and risk is above `low`.
- * `execution_mode === 'server'` → no desktop confirmation (server-side path).
+ * Tauri / desktop: whether to show the local **risk confirmation** dialog before running a client tool.
+ * - `low` → no dialog
+ * - `medium` → show dialog (user taps OK on the device)
+ * - `high` / `critical` → no dialog here; gating is **agent approval** (Approvals) only, not a second popup
+ * `execution_mode === 'server'` → no desktop dialog (server-side path).
  */
 export function clientToolNeedsConfirm(
   riskLevel: string | undefined,
@@ -57,7 +81,7 @@ export function clientToolNeedsConfirm(
     return false;
   }
   const r = (riskLevel || 'medium').toLowerCase();
-  return r !== 'low';
+  return r === 'medium';
 }
 
 /** Normalize ReAct SSE or service JSON into ClientToolCall. */
@@ -76,7 +100,16 @@ export function normalizeClientToolPayload(parsed: Record<string, unknown>): Cli
   }
   const riskLevel = typeof parsed.risk_level === 'string' ? parsed.risk_level : undefined;
   const executionMode = typeof parsed.execution_mode === 'string' ? parsed.execution_mode : undefined;
-  console.log('[DEBUG] normalizeClientToolPayload:', { callId, toolName, riskLevel, executionMode, raw: parsed });
+  let approvalId: number | undefined;
+  const rawAid = parsed.approval_id;
+  if (typeof rawAid === 'number' && Number.isFinite(rawAid)) {
+    approvalId = rawAid;
+  } else if (typeof rawAid === 'string' && /^\d+$/.test(rawAid.trim())) {
+    approvalId = Number(rawAid.trim());
+  }
+  if (import.meta.env.DEV) {
+    console.debug('[normalizeClientToolPayload]', { callId, toolName, riskLevel, executionMode, approvalId });
+  }
   return {
     call_id: callId,
     tool_name: toolName,
@@ -84,6 +117,7 @@ export function normalizeClientToolPayload(parsed: Record<string, unknown>): Cli
     hint: typeof parsed.hint === 'string' ? parsed.hint : undefined,
     risk_level: riskLevel,
     execution_mode: executionMode,
+    ...(approvalId != null && approvalId > 0 ? { approval_id: approvalId } : {}),
   };
 }
 
@@ -215,13 +249,59 @@ export function createStreamingTypewriter(
   };
 }
 
+/** Payload for SSE `plan_tasks` (plan-and-execute mode). */
+export interface PlanTaskItemPayload {
+  index: number;
+  task: string;
+}
+
+export interface ReActEvent {
+  type:
+    | 'thought'
+    | 'action'
+    | 'observation'
+    | 'reflection'
+    | 'final_answer'
+    | 'error'
+    | 'plan_tasks'
+    | 'plan_step';
+  content: string;
+  step?: number;
+  tool?: string;
+  /** Set on `plan_tasks` */
+  plan_tasks?: PlanTaskItemPayload[];
+  /** Set on `plan_step`: running → done | error */
+  plan_step_status?: 'running' | 'done' | 'error';
+}
+
+/** Go `ReActEvent` uses JSON field `type`; ADK-style lines use `event_type`. Match web `chatParseStreamEvents.ts`. */
+const REACT_SSE_KINDS = new Set([
+  'thought',
+  'action',
+  'observation',
+  'reflection',
+  'final_answer',
+  'error',
+]);
+
+function reactSseKind(parsed: Record<string, unknown>): string | null {
+  const et = typeof parsed.event_type === 'string' ? parsed.event_type : '';
+  if (et && REACT_SSE_KINDS.has(et)) return et;
+  const t = typeof parsed.type === 'string' ? parsed.type : '';
+  if (t && REACT_SSE_KINDS.has(t)) return t;
+  return null;
+}
+
 function handleSseDataLine(
   data: string,
   opts: {
     onChunk: (content: string) => void;
+    onReActEvent?: (event: ReActEvent) => void;
     onClientToolCall?: (call: ClientToolCall) => void;
     onApprovalPending?: (approvalId: number, toolName: string) => void;
     accumulatedRef: { value: string };
+    /** e.g. `chat/stream` | `tool_result/stream` — desktop diagnostics */
+    streamLogContext?: string;
   },
 ): void {
   if (data === '[DONE]') {
@@ -256,6 +336,54 @@ function handleSseDataLine(
         return;
       }
     }
+    // Plan-and-execute: structured task list for desktop checklist (not in REACT_SSE_KINDS token stream)
+    if (parsed.type === 'plan_tasks' || parsed.type === 'plan_step') {
+      const rawTasks = parsed.plan_tasks;
+      let plan_tasks: PlanTaskItemPayload[] | undefined;
+      if (Array.isArray(rawTasks)) {
+        plan_tasks = rawTasks.map((r) => {
+          const o = r as Record<string, unknown>;
+          const ix = o.index;
+          const idx = typeof ix === 'number' ? ix : Number(ix);
+          return {
+            index: Number.isFinite(idx) ? idx : 0,
+            task: String(o.task ?? ''),
+          };
+        });
+      }
+      const pss = parsed.plan_step_status;
+      const plan_step_status =
+        pss === 'running' || pss === 'done' || pss === 'error' ? pss : undefined;
+      opts.onReActEvent?.({
+        type: parsed.type as 'plan_tasks' | 'plan_step',
+        content: String(parsed.content ?? ''),
+        step: typeof parsed.step === 'number' ? parsed.step : undefined,
+        plan_tasks,
+        plan_step_status,
+      });
+      return;
+    }
+    // ReAct: server sends `type` (Go ReActEvent) or `event_type` (some ADK payloads)
+    const reactKind = reactSseKind(parsed);
+    if (reactKind) {
+      const reactEvent: ReActEvent = {
+        type: reactKind as ReActEvent['type'],
+        content: String(parsed.content || ''),
+        step: parsed.step as number | undefined,
+        tool: parsed.tool as string | undefined,
+      };
+      if (
+        (reactKind === 'final_answer' || reactKind === 'error') &&
+        isExactGenericStreamFailureZh(reactEvent.content)
+      ) {
+        console.warn(
+          `[taskmate-desktop][${opts.streamLogContext ?? 'SSE'}] ReAct ${reactKind} 为服务端通用失败占位`,
+          { step: reactEvent.step, preview: reactEvent.content.slice(0, 80) },
+        );
+      }
+      opts.onReActEvent?.(reactEvent);
+      return;
+    }
     if (typeof parsed.content === 'string' && parsed.content) {
       opts.accumulatedRef.value += parsed.content;
       opts.onChunk(opts.accumulatedRef.value);
@@ -270,47 +398,100 @@ async function consumeEventStream(
   response: Response,
   opts: {
     onChunk: (content: string) => void;
+    onReActEvent?: (event: ReActEvent) => void;
     onDone: () => void;
     onError: (e: Error) => void;
     onClientToolCall?: (call: ClientToolCall) => void;
     onApprovalPending?: (approvalId: number, toolName: string) => void;
     signal: AbortSignal;
+    /** Desktop: label streams so logs show whether failure came from initial chat or tool_result resume. */
+    streamLogContext?: string;
   },
 ): Promise<void> {
   const accumulatedRef = { value: '' };
   let sawDone = false;
   let buffer = '';
+  let loggedGenericTokenPath = false;
+
+  const ctx = opts.streamLogContext ?? 'SSE';
+
+  /** ReAct `type` / plan_* counts — plain `content` token 不会进这里，故可与 accumulatedChars 对照 */
+  const reactFrameCounts: Record<string, number> = {};
+  let clientToolCallsInStream = 0;
+
+  const onChunkForward = (full: string): void => {
+    if (!loggedGenericTokenPath && isExactGenericStreamFailureZh(full)) {
+      loggedGenericTokenPath = true;
+      console.warn(`[taskmate-desktop][${ctx}] 主文本区出现通用失败占位 (content 累加路径)`, {
+        chars: full.length,
+      });
+    }
+    opts.onChunk(full);
+  };
+
+  const onReActWrapped = (evt: ReActEvent): void => {
+    reactFrameCounts[evt.type] = (reactFrameCounts[evt.type] ?? 0) + 1;
+    opts.onReActEvent?.(evt);
+  };
+
+  const onClientToolWrapped = (call: ClientToolCall): void => {
+    clientToolCallsInStream += 1;
+    opts.onClientToolCall?.(call);
+  };
+
+  const onDoneWithLog = (): void => {
+    const acc = accumulatedRef.value;
+    const hasReactOnly =
+      acc.length === 0 && Object.keys(reactFrameCounts).length > 0;
+    console.info(`[taskmate-desktop][${ctx}] 流结束`, {
+      accumulatedChars: acc.length,
+      isOnlyGenericFailure: isExactGenericStreamFailureZh(acc),
+      preview: acc.length ? acc.slice(0, 200) : '(empty)',
+      reactFrames: reactFrameCounts,
+      clientToolCalls: clientToolCallsInStream,
+      ...(hasReactOnly
+        ? {
+            note: '无 plain content 累加属正常：本段 SSE 只有 ReAct/工具帧（常见于暂停等客户端工具或紧接着下一轮 tool）',
+          }
+        : {}),
+    });
+    opts.onDone();
+  };
 
   const handleDataLine = (line: string): void => {
     if (line === '[DONE]') {
       sawDone = true;
-      opts.onDone();
+      onDoneWithLog();
       return;
     }
     handleSseDataLine(line, {
-      onChunk: opts.onChunk,
-      onClientToolCall: opts.onClientToolCall,
+      onChunk: onChunkForward,
+      onReActEvent: onReActWrapped,
+      onClientToolCall: onClientToolWrapped,
       onApprovalPending: opts.onApprovalPending,
       accumulatedRef,
+      streamLogContext: ctx,
     });
   };
 
   const consumeBuffer = (): void => {
-    let boundary: number;
-    while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      for (const line of block.split('\n')) {
-        const trimmed = line.replace(/\r$/, '');
-        if (!trimmed.startsWith('data:')) continue;
-        handleDataLine(trimmed.slice(5).trimStart());
+    unstable_batchedUpdates(() => {
+      let boundary: number;
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        for (const line of block.split('\n')) {
+          const trimmed = line.replace(/\r$/, '');
+          if (!trimmed.startsWith('data:')) continue;
+          handleDataLine(trimmed.slice(5).trimStart());
+        }
       }
-    }
+    });
   };
 
   const reader = response.body?.getReader();
   if (!reader) {
-    opts.onError(new Error('No response body'));
+    opts.onError?.(new Error('No response body'));
     return;
   }
 
@@ -328,31 +509,34 @@ async function consumeEventStream(
 
     if (!sawDone) {
       if (buffer.trim()) {
-        for (const line of buffer.split('\n')) {
-          const trimmed = line.replace(/\r$/, '');
-          if (trimmed.startsWith('data:')) {
-            handleDataLine(trimmed.slice(5).trimStart());
+        unstable_batchedUpdates(() => {
+          for (const line of buffer.split('\n')) {
+            const trimmed = line.replace(/\r$/, '');
+            if (trimmed.startsWith('data:')) {
+              handleDataLine(trimmed.slice(5).trimStart());
+            }
           }
-        }
+        });
       }
       if (!sawDone) {
         if (accumulatedRef.value) {
-          opts.onDone();
+          onDoneWithLog();
         } else {
-          opts.onError(new Error('Stream connection failed'));
+          opts.onError?.(new Error('Stream connection failed'));
         }
       }
     }
   } catch (err: unknown) {
     if (!opts.signal.aborted) {
-      opts.onError(err instanceof Error ? err : new Error(String(err)));
+      opts.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
   }
 }
 
+/** Current user's permitted agents (RBAC via role → agent). Use /agents, not /agents/all. */
 export const listAgents = async (): Promise<Agent[]> => {
   const apiUrl = await getApiUrl();
-  const response = await fetch(`${apiUrl}/agents/all`, {
+  const response = await fetch(`${apiUrl}/agents`, {
     headers: { Authorization: `Bearer ${localStorage.getItem('access_token')}` },
   });
   const json = await response.json();
@@ -476,15 +660,48 @@ export function flushMessagesAfterToolResult(
   }, 500);
 }
 
+/**
+ * After POST /chat/stream ends with [DONE]: the server persists the turn in `recordConversationAsync`
+ * (goroutine). The first GET /messages can run before the DB write finishes, so the UI would clear
+ * the typewriter and show history without the new assistant row — looks like the reply vanished.
+ * Mirror tool_result retries so history catches up shortly after.
+ */
+export function flushMessagesAfterChatStream(
+  loadMessages: (opts?: { silent?: boolean; sessionId?: string }) => void | Promise<void>,
+  sessionId: string,
+): void {
+  void loadMessages({ silent: true, sessionId });
+  window.setTimeout(() => {
+    void loadMessages({ silent: true, sessionId });
+  }, 450);
+  window.setTimeout(() => {
+    void loadMessages({ silent: true, sessionId });
+  }, 1200);
+}
+
+/** Same as POST /chat/stream — Tauri must send `desktop` so resume ReAct saves `client_tool` state with client_type. */
+async function resolveClientTypeForApi(): Promise<'web' | 'desktop'> {
+  try {
+    const { isTauri } = await import('@tauri-apps/api/core');
+    if (typeof isTauri === 'function' && isTauri()) {
+      return 'desktop';
+    }
+  } catch {
+    /* not Tauri */
+  }
+  return 'web';
+}
+
 export const submitToolResult = async (sessionId: string, callId: string, result: string, error?: string): Promise<void> => {
   const apiUrl = await getApiUrl();
+  const clientType = await resolveClientTypeForApi();
   await fetch(`${apiUrl}/chat/tool_result`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${localStorage.getItem('access_token')}`,
     },
-    body: JSON.stringify({ session_id: sessionId, call_id: callId, result, error }),
+    body: JSON.stringify({ session_id: sessionId, call_id: callId, result, error, client_type: clientType }),
   });
 };
 
@@ -498,6 +715,9 @@ export const submitToolResultStream = (
   onDone: (sessionId: string) => void,
   onError: (error: Error) => void,
   onClientToolCall?: (call: ClientToolCall) => void,
+  onApprovalPending?: (approvalId: number, toolName: string) => void,
+  /** Plan-and-execute: same as POST /chat/stream — merge `plan_tasks` / `plan_step` into the checklist. */
+  onReActEvent?: (event: ReActEvent) => void,
 ): void => {
   closeStream();
 
@@ -505,7 +725,7 @@ export const submitToolResultStream = (
     const sid = String(sessionId ?? '').trim();
     const cid = String(callId ?? '').trim();
     if (!sid || !cid) {
-      onError(new Error('Missing session_id or call_id'));
+      onError?.(new Error('Missing session_id or call_id'));
       return;
     }
     const apiUrl = await getApiUrl();
@@ -517,12 +737,14 @@ export const submitToolResultStream = (
     const url = `${apiUrl}/chat/tool_result/stream`;
     const sidShort = sid.length > 12 ? `${sid.slice(0, 12)}…` : sid;
     const cidShort = cid.length > 24 ? `${cid.slice(0, 24)}…` : cid;
+    const clientType = await resolveClientTypeForApi();
     console.info('[tool_result/stream] posting client tool result to server', {
       url,
       session_id: sidShort,
       call_id: cidShort,
       resultChars: result.length,
       hasToolError: Boolean(toolError?.trim()),
+      client_type: clientType,
     });
 
     try {
@@ -533,14 +755,14 @@ export const submitToolResultStream = (
           Authorization: `Bearer ${token}`,
           Accept: 'text/event-stream',
         },
-        body: JSON.stringify({ session_id: sid, call_id: cid, result, error: toolError }),
+        body: JSON.stringify({ session_id: sid, call_id: cid, result, error: toolError, client_type: clientType }),
         signal,
       });
 
       if (!response.ok) {
         const text = await response.text().catch(() => '');
         console.warn('[tool_result/stream] HTTP error', response.status, text?.slice(0, 200));
-        onError(new Error(text || `HTTP ${response.status}`));
+        onError?.(new Error(text || `HTTP ${response.status}`));
         return;
       }
 
@@ -548,7 +770,15 @@ export const submitToolResultStream = (
 
       await consumeEventStream(response, {
         onChunk,
+        // Go ReAct SSE uses `type` (not `event_type`); errors must still reach the typewriter.
+        onReActEvent: (evt) => {
+          onReActEvent?.(evt);
+          if (evt.type === 'error') {
+            onChunk(evt.content);
+          }
+        },
         onClientToolCall,
+        onApprovalPending,
         onDone: () => {
           console.info('[tool_result/stream] SSE finished; server resumed agent loop');
           onDone(sid);
@@ -558,6 +788,7 @@ export const submitToolResultStream = (
           onError(e);
         },
         signal,
+        streamLogContext: 'tool_result/stream',
       });
     } catch (err: unknown) {
       if (!signal.aborted) {
@@ -578,8 +809,9 @@ export const submitToolResultStream = (
 export const streamChatMessage = (
   req: ChatRequest,
   onChunk: (content: string) => void,
-  onDone: (sessionId: string) => void,
-  onError: (error: Error) => void,
+  onReActEvent?: (event: ReActEvent) => void,
+  onDone?: (sessionId: string) => void,
+  onError?: (error: Error) => void,
   onClientToolCall?: (call: ClientToolCall) => void,
   onApprovalPending?: (approvalId: number, toolName: string) => void,
 ): void => {
@@ -592,16 +824,7 @@ export const streamChatMessage = (
     currentStreamAbort = abort;
     const { signal } = abort;
 
-    // `import('@tauri-apps/api/core')` succeeds in a normal browser if the package is bundled — it does not mean Tauri is available.
-    let clientType: 'web' | 'desktop' = 'web';
-    try {
-      const { isTauri } = await import('@tauri-apps/api/core');
-      if (typeof isTauri === 'function' && isTauri()) {
-        clientType = 'desktop';
-      }
-    } catch {
-      clientType = 'web';
-    }
+    const clientType = await resolveClientTypeForApi();
 
     try {
       const response = await fetch(`${apiUrl}/chat/stream`, {
@@ -617,21 +840,23 @@ export const streamChatMessage = (
 
       if (!response.ok) {
         const text = await response.text().catch(() => '');
-        onError(new Error(text || `HTTP ${response.status}`));
+        onError?.(new Error(text || `HTTP ${response.status}`));
         return;
       }
 
       await consumeEventStream(response, {
         onChunk,
+        onReActEvent,
         onClientToolCall,
         onApprovalPending,
-        onDone: () => onDone(req.session_id || ''),
-        onError,
+        onDone: () => onDone?.(req.session_id || ''),
+        onError: (e: Error) => onError?.(e),
         signal,
+        streamLogContext: 'chat/stream',
       });
     } catch (err: unknown) {
       if (!signal.aborted) {
-        onError(err instanceof Error ? err : new Error(String(err)));
+        onError?.(err instanceof Error ? err : new Error(String(err)));
       }
     } finally {
       if (currentStreamAbort === abort) {
@@ -650,6 +875,129 @@ export const closeStream = (): void => {
   }
 };
 
+/** Persist ClientToolCall while waiting for external (web) approval so refresh / session restore can resume. */
+export function approvalDeferredStorageKey(sessionId: string, approvalId: number): string {
+  return `aitaskmeta:approval_deferred:${sessionId}:${approvalId}`;
+}
+
+export function saveApprovalDeferredCall(sessionId: string, call: ClientToolCall): void {
+  if (!sessionId.trim() || !call.approval_id || call.approval_id <= 0) return;
+  try {
+    const key = approvalDeferredStorageKey(sessionId, call.approval_id);
+    sessionStorage.setItem(key, JSON.stringify(call));
+    sessionStorage.removeItem(`sya:approval_deferred:${sessionId}:${call.approval_id}`);
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+export function loadApprovalDeferredCall(sessionId: string, approvalId: number): ClientToolCall | null {
+  try {
+    const key = approvalDeferredStorageKey(sessionId, approvalId);
+    let raw = sessionStorage.getItem(key);
+    if (!raw) {
+      raw = sessionStorage.getItem(`sya:approval_deferred:${sessionId}:${approvalId}`);
+    }
+    if (!raw) return null;
+    return JSON.parse(raw) as ClientToolCall;
+  } catch {
+    return null;
+  }
+}
+
+export function clearApprovalDeferredCall(sessionId: string, approvalId: number): void {
+  try {
+    sessionStorage.removeItem(approvalDeferredStorageKey(sessionId, approvalId));
+    sessionStorage.removeItem(`sya:approval_deferred:${sessionId}:${approvalId}`);
+  } catch {
+    /* */
+  }
+}
+
+/** Approval ids for which we have a persisted ClientToolCall in sessionStorage. */
+export function listDeferredApprovalIdsForSession(sessionId: string): number[] {
+  if (!sessionId.trim()) return [];
+  const prefixes = [
+    `aitaskmeta:approval_deferred:${sessionId}:`,
+    `sya:approval_deferred:${sessionId}:`,
+  ];
+  const ids: number[] = [];
+  try {
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const key = sessionStorage.key(i);
+      if (!key) continue;
+      for (const prefix of prefixes) {
+        if (key.startsWith(prefix)) {
+          const id = Number(key.slice(prefix.length));
+          if (Number.isFinite(id) && id > 0) ids.push(id);
+        }
+      }
+    }
+  } catch {
+    /* */
+  }
+  return [...new Set(ids)].sort((a, b) => a - b);
+}
+
+export type ReconcileDeferredApprovalsResult =
+  | { type: 'run_approved'; call: ClientToolCall }
+  | {
+      type: 'still_pending';
+      approvalId: number;
+      toolName: string;
+      deferred: ClientToolCall;
+    }
+  | { type: 'idle' };
+
+/**
+ * Re-check server approval for each locally persisted deferred client tool.
+ * Use when the user left the chat (no SSE) while someone approved elsewhere: the request is no longer
+ * `pending`, so getPendingApprovalBySession is empty, but we must still run the Tauri handler.
+ */
+export async function reconcileDeferredApprovalsFromStorage(
+  sessionId: string,
+): Promise<ReconcileDeferredApprovalsResult> {
+  const ids = listDeferredApprovalIdsForSession(sessionId);
+  let firstPending: { approvalId: number; toolName: string; deferred: ClientToolCall } | null = null;
+
+  for (const approvalId of ids) {
+    let st: string;
+    try {
+      st = (await getApprovalStatus(approvalId)).status;
+    } catch {
+      continue;
+    }
+    if (st === 'approved') {
+      const deferred = loadApprovalDeferredCall(sessionId, approvalId);
+      clearApprovalDeferredCall(sessionId, approvalId);
+      if (deferred?.call_id?.trim()) {
+        return { type: 'run_approved', call: deferred };
+      }
+      continue;
+    }
+    if (st === 'rejected' || st === 'expired') {
+      clearApprovalDeferredCall(sessionId, approvalId);
+      continue;
+    }
+    if (st === 'pending') {
+      const deferred = loadApprovalDeferredCall(sessionId, approvalId);
+      if (deferred?.call_id?.trim() && !firstPending) {
+        firstPending = { approvalId, toolName: deferred.tool_name, deferred };
+      }
+    }
+  }
+
+  if (firstPending) {
+    return {
+      type: 'still_pending',
+      approvalId: firstPending.approvalId,
+      toolName: firstPending.toolName,
+      deferred: firstPending.deferred,
+    };
+  }
+  return { type: 'idle' };
+}
+
 export async function getApprovalStatus(approvalId: number): Promise<{ status: string; approver_id?: string; comment?: string }> {
   const apiUrl = await getApiUrl();
   const response = await fetch(`${apiUrl}/approvals/${approvalId}`, {
@@ -658,8 +1006,16 @@ export async function getApprovalStatus(approvalId: number): Promise<{ status: s
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
-  const data = await response.json();
-  return data.data || {};
+  const data = (await response.json()) as { data?: Record<string, unknown> };
+  const payload = (data?.data ?? data) as Record<string, unknown>;
+  const rawStatus = payload?.status;
+  const status =
+    typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+  return {
+    status,
+    approver_id: typeof payload.approver_id === 'string' ? payload.approver_id : undefined,
+    comment: typeof payload.comment === 'string' ? payload.comment : undefined,
+  };
 }
 
 export async function getPendingApprovalBySession(sessionId: string): Promise<{ id: number; tool_name: string } | null> {

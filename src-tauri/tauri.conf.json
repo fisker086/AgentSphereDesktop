@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agentsphere",
+  "productName": "SuiYu Agent",
   "version": "0.1.0",
-  "identifier": "com.kai.agentsphere",
+  "identifier": "com.sya.agent",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "AgentSphere",
+        "title": "SuiYu Agent",
         "width": 1280,
         "height": 800,
         "resizable": true,

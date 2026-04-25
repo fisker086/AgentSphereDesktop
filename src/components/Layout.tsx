@@ -29,7 +29,7 @@ import {
   Psychology as PsychologyIcon,
 } from '@mui/icons-material';
 import { useNavigate, useLocation, Outlet } from 'react-router-dom';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/useAuth';
 import { reloadClientModeTools } from '../api/chat';
 import { useThemeMode } from '../contexts/ThemeModeContext';
 import { useTranslation } from 'react-i18next';
@@ -69,9 +69,10 @@ const Layout: React.FC = () => {
 
   const isAgentChatRoute = location.pathname.startsWith('/agent/');
 
-  const currentPage = location.pathname.startsWith('/agent')
+  const selectedNavId = location.pathname.startsWith('/agent')
     ? 'agents'
-    : pages.find((p) => p.path === location.pathname)?.id || 'dashboard';
+    : pages.find((p) => p.path === location.pathname)?.id ??
+      (location.pathname === '/' || location.pathname === '' ? 'dashboard' : undefined);
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', bgcolor: 'background.default' }}>
@@ -93,7 +94,7 @@ const Layout: React.FC = () => {
               <SmartToyIcon sx={{ color: 'primary.contrastText', fontSize: 20 }} />
             </Box>
             <Typography variant="h6" fontWeight="bold" color="text.primary">
-              AgentSphere
+              {t('app.name')}
             </Typography>
           </Box>
 
@@ -158,7 +159,7 @@ const Layout: React.FC = () => {
               {pages.map((page) => (
                 <ListItem key={page.id} disablePadding sx={{ px: 1, py: 0.5 }}>
                   <ListItemButton
-                    selected={currentPage === page.id}
+                    selected={selectedNavId === page.id}
                     onClick={() => navigate(page.path)}
                     sx={{
                       borderRadius: 2,
@@ -174,7 +175,7 @@ const Layout: React.FC = () => {
                     <ListItemIcon
                       sx={{
                         minWidth: 40,
-                        color: currentPage === page.id ? 'primary.main' : 'text.secondary',
+                        color: selectedNavId === page.id ? 'primary.main' : 'text.secondary',
                       }}
                     >
                       {page.icon}
@@ -182,7 +183,7 @@ const Layout: React.FC = () => {
                     <ListItemText
                       primary={page.label}
                       primaryTypographyProps={{
-                        fontWeight: currentPage === page.id ? 600 : 400,
+                        fontWeight: selectedNavId === page.id ? 600 : 400,
                       }}
                     />
                   </ListItemButton>
@@ -200,6 +201,8 @@ const Layout: React.FC = () => {
             >
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
                 <Avatar
+                  src={user?.avatar_url || undefined}
+                  onClick={() => navigate('/profile')}
                   sx={{
                     width: 40,
                     height: 40,
@@ -207,16 +210,21 @@ const Layout: React.FC = () => {
                     fontSize: 16,
                     fontWeight: 600,
                     flexShrink: 0,
+                    cursor: 'pointer',
                   }}
                 >
-                  {user?.username?.charAt(0).toUpperCase() ?? '?'}
+                  {!user?.avatar_url ? (user?.username?.charAt(0).toUpperCase() ?? '?') : null}
                 </Avatar>
-                <Box sx={{ flex: 1, minWidth: 0 }}>
+                <Box
+                  sx={{ flex: 1, minWidth: 0, cursor: 'pointer' }}
+                  onClick={() => navigate('/profile')}
+                  role="presentation"
+                >
                   <Typography variant="body2" fontWeight={600} noWrap title={user?.username}>
                     {user?.username ?? '—'}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary" noWrap title={user?.email ?? ''}>
-                    {user?.email?.trim() ? user.email : '—'}
+                  <Typography variant="caption" color="text.secondary" noWrap>
+                    {t('nav.profile')}
                   </Typography>
                 </Box>
                 <Tooltip title={t('nav.logout')}>

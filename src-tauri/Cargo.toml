@@ -1,7 +1,7 @@
 [package]
-name = "agentsphere"
+name = "taskmate"
 version = "0.1.0"
-description = "A Tauri App"
+description = "TaskMate desktop (Tauri)"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "agentsphere_lib"
+name = "taskmate_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -27,7 +27,24 @@ wasmtime = "25"
 rquickjs = "0.11"
 anyhow = "1"
 headless_chrome = "1.0.21"
-ureq = { version = "2", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls"] }
 tauri-plugin-dialog = "2"
 base64 = "0.22.1"
+chrono = "0.4"
+chrono-tz = "0.10"
+regex = "1"
+lazy_static = "1"
+csv = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+native-tls = "0.2"
+dns-lookup = "2"
+sysinfo = "0.32"
+toml = "0.8"
+serde_yaml = "0.9"
+num-bigint = "0.4"
+num-traits = "0.2"
+redis = "0.27"
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+mysql = "24"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 

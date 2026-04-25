@@ -29,6 +29,20 @@
 - **本机能力**：在需要时执行仅能在用户电脑上完成的操作（例如打开本地文件、调用本机浏览器或容器），结果再回传给服务端继续编排。
 - **服务端**：必须单独部署并保持可访问；桌面端只保存「连哪台服务器」，不替代后端。
 
+### Tauri 构建报错：`failed to read plugin permissions` 且路径指向别的目录（如 `.../AgentSphere/.../target/...`）
+
+**原因**：`tauri-build` 会读取依赖 `tauri` 在 **`target/debug/build/tauri-*/out/`** 里生成的权限文件列表，里面是**绝对路径**。若环境变量 **`CARGO_TARGET_DIR`** 指到了旧工程目录、或你曾在**同一套 `target/`** 下编过另一个路径下的工程，Cargo 可能复用那份产物，路径仍指向旧仓库（例如 `AgentSphere`）。
+
+**处理**（在 `src-tauri` 目录执行）：
+
+```bash
+unset CARGO_TARGET_DIR
+rm -rf target
+cargo build
+```
+
+若 shell 或 IDE（含 rust-analyzer）里配置了 `CARGO_TARGET_DIR`，请删掉或改成不要指向其它项目的 `target`。本仓库已在 `src-tauri/.cargo/config.toml` 写明默认使用本目录下的 `target/`。
+
 ---
 
 ## 如何设置服务地址
@@ -43,7 +57,7 @@
 | 场景 | 应填写的「服务器地址」 |
 |------|------------------------|
 | 本机默认后端 | `http://localhost:8080` |
-| 局域网或域名 | `https://agentsphere.example.com` |
+| 局域网或域名 | `https://sya.example.com` |
 | 带端口 | `http://192.168.1.10:8080` |
 
 ### 公网试用与私有化部署
@@ -53,23 +67,23 @@
   在「服务器设置」中填入该根地址即可（与上表规则相同，不带 `/api/v1`）。
 
 - **私有化部署**：可自行拉取容器镜像部署服务端，例如：  
-  `ghcr.nju.edu.cn/fisker086/agentsphere:latest`  
+  `ghcr.nju.edu.cn/fisker086/sya:latest`  
 
 #### 本机用 Docker Compose 启动服务端（联调桌面端）
 
 在 **仓库根目录**（与 `docker-compose.yml`、`.env.example` 同级，不是 `AgentSphere/` 子目录）操作。
 
 1. **准备 `.env`**：将 **`.env.example` 复制一份并命名为 `.env`**（保留 `.env.example` 作为模板，不要只做重命名以免丢失示例）。用编辑器打开 `.env`，填写至少 **`JWT_SECRET_KEY`**、**`OPENAI_API_KEY`**、**`ADMIN_DEFAULT_PASSWORD`** 等（见下表与根目录 `README.md`）。
-2. **启动**（自带 PostgreSQL + pgvector，profile **`with-db`**）：
+2. **启动**（默认自带 PostgreSQL + pgvector）：
 
 ```bash
-docker compose --profile with-db pull
-docker compose --profile with-db up -d
+docker compose pull
+docker compose up -d
 ```
 
 3. 桌面端「服务器地址」填 **`http://localhost:8080`**（与 `.env` 里 `SERVER_PORT` 一致）。
 
-更完整的步骤与「使用已有数据库、不用 with-db」等说明见仓库根目录 **`README.md`**、**`DOCKER-COMPOSE.md`**。
+更完整的步骤见仓库根目录 **`README.md`**。
 
 以下为服务端进程会读取的环境变量（与仓库根目录 `.env.example`、`docker-compose.yml` 一致；`docker run`/编排时传入等价配置即可）。
 
@@ -135,20 +149,20 @@ docker compose --profile with-db up -d
 | `LANGFUSE_HOST` | 默认 `https://cloud.langfuse.com`。 |
 
 
-**使用 Docker Compose 且带内置 Postgres 时**（`export COMPOSE_PROFILES=with-db` 或 `--profile with-db`）
+**使用 Docker Compose 时（默认带内置 Postgres）**
 
 | 变量 | 说明 |
 |------|------|
 | `POSTGRES_USER` | 内置库用户名（默认 `postgres`）。 |
 | `POSTGRES_PASSWORD` | 内置库密码。 |
-| `POSTGRES_DB` | 库名（默认 `agentsphere`）。 |
+| `POSTGRES_DB` | 库名（默认 `sya`）。 |
 
-Compose 未单独写 `DATABASE_URL` 时，会为应用拼默认连接串指向服务名 `postgres`；若使用**外部数据库**，请自行设置 `DATABASE_URL` 并勿依赖内置 `postgres` 服务。
+未在 `.env` 中设置 `DATABASE_URL` 时，应用使用默认连接串指向服务名 `postgres`；若使用**外部数据库**，在 `.env` 中设置 `DATABASE_URL` 覆盖即可（高级场景若需不启动内置 Postgres，可用 compose override）。
 
 **示例（shell 中 export，再启动容器/进程）**
 
 ```bash
-export DATABASE_URL='postgres://user:pass@host:5432/agentsphere?sslmode=disable'
+export DATABASE_URL='postgres://user:pass@host:5432/sya?sslmode=disable'
 export JWT_SECRET_KEY="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='sk-...'
 export ADMIN_DEFAULT_PASSWORD='your-strong-password'
@@ -164,14 +178,13 @@ export ADMIN_WHITELIST='admin'
 2. **持久化位置**：保存后会写入本机配置文件（JSON），并同步到应用内本地存储；下次启动会优先读取配置文件中的地址。
 
 **配置文件路径**（应用内若提供「查看配置路径」可核对）：
+- **Windows**：一般在 `%APPDATA%\sya\config.json`（即「用户\AppData\Roaming\sya\config.json」）。
 
-- **Windows**：一般在 `%APPDATA%\agentsphere\config.json`（即「用户\AppData\Roaming\agentsphere\config.json」）。
-- **macOS**：一般在 `~/Library/Application Support/agentsphere/config.json`。
+- **macOS**：一般在 `~/Library/Application Support/sya/config.json`。
 
 文件中的 `server_url` 字段即为当前保存的根地址。
 
 ### 默认值
 
 未配置时使用：`http://localhost:8080`（需本机已启动 AgentSphere 服务端且端口一致）。
-
 

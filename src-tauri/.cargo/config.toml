@@ -1,0 +1,11 @@
+# Default: artifacts live under this crate's `src-tauri/target/`.
+#
+# If you see build errors like:
+#   failed to read .../AgentSphere/.../target/debug/build/tauri-.../out/permissions/...
+# then Cargo is reusing another project's target directory (often because CARGO_TARGET_DIR
+# is set in the shell or IDE). Unset it and run `cargo clean` then `cargo build`:
+#   unset CARGO_TARGET_DIR
+#   rm -rf target && cargo build
+#
+[build]
+target-dir = "target"

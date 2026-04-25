@@ -17,7 +17,8 @@ fn str_arg(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> String {
 
 fn allowed_ops() -> HashSet<&'static str> {
     [
-        "ps", "images", "logs", "inspect", "stats", "network", "volume", "info", "version", "events",
+        "ps", "images", "logs", "inspect", "stats", "network", "volume", "info", "version",
+        "events",
     ]
     .into_iter()
     .collect()
@@ -146,7 +147,9 @@ fn shell_escape(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._:-@".contains(c)) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._:-@".contains(c))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))

@@ -22,6 +22,7 @@ import {
   Card,
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
+import type { Theme } from '@mui/material/styles';
 import {
   Refresh as RefreshIcon,
   Schedule as ScheduleIcon,
@@ -54,6 +55,31 @@ const getStatusColor = (status: string): string => {
 };
 
 type ApprovalTab = 'pending' | 'approved' | 'rejected' | 'expired' | 'all';
+
+const approvalsActionHeadCellSx = (theme: Theme) => ({
+  position: 'sticky' as const,
+  right: 0,
+  zIndex: 3,
+  fontWeight: 600,
+  whiteSpace: 'nowrap' as const,
+  minWidth: 168,
+  textAlign: 'center' as const,
+  bgcolor: alpha(theme.palette.primary.main, 0.08),
+  boxShadow: `-6px 0 10px -4px ${alpha(theme.palette.common.black, 0.12)}`,
+});
+
+const approvalsActionBodyCellSx = (theme: Theme) => ({
+  position: 'sticky' as const,
+  right: 0,
+  zIndex: 2,
+  whiteSpace: 'nowrap' as const,
+  minWidth: 168,
+  bgcolor: 'background.paper',
+  boxShadow: `-6px 0 10px -4px ${alpha(theme.palette.common.black, 0.12)}`,
+  '.MuiTableRow-root:hover &': {
+    bgcolor: theme.palette.action.hover,
+  },
+});
 
 const ApprovalsPage: React.FC = () => {
   const { t, i18n } = useTranslation();
@@ -202,7 +228,7 @@ const ApprovalsPage: React.FC = () => {
           {t('approvals.approvalsBannerHint')}
         </Alert>
 
-        <Card elevation={0} sx={{ borderRadius: 3, border: '1px solid', borderColor: 'divider', overflow: 'hidden' }}>
+        <Card elevation={0} sx={{ borderRadius: 3, border: '1px solid', borderColor: 'divider', overflow: 'visible' }}>
           <Tabs
             value={activeTab}
             onChange={(_, v) => { setActiveTab(v); setPage(1); }}
@@ -214,56 +240,86 @@ const ApprovalsPage: React.FC = () => {
             <Tab value="all" icon={<ViewListIcon />} label={t('approvals.approvalTabAll')} />
           </Tabs>
 
-          <TableContainer>
-            <Table size="medium">
+          <TableContainer sx={{ overflowX: 'auto', maxWidth: '100%' }}>
+            <Table size="medium" sx={{ minWidth: 1080, tableLayout: 'auto' }}>
               <TableHead>
                 <TableRow sx={{ bgcolor: (th) => alpha(th.palette.primary.main, 0.08) }}>
                   <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnId')}</TableCell>
                   <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnTool')}</TableCell>
+                  <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnAgent')}</TableCell>
                   <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnRisk')}</TableCell>
                   <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnStatus')}</TableCell>
-                  <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnInput')}</TableCell>
-                  <TableCell sx={{ fontWeight: 600 }}>{t('approvals.columnTime')}</TableCell>
-                  <TableCell align="right" sx={{ fontWeight: 600 }}>{t('approvals.actions')}</TableCell>
+                  <TableCell sx={{ fontWeight: 600, minWidth: 200, maxWidth: 480 }}>{t('approvals.columnInput')}</TableCell>
+                  <TableCell sx={{ fontWeight: 600, whiteSpace: 'nowrap' }}>{t('approvals.columnTime')}</TableCell>
+                  <TableCell sx={approvalsActionHeadCellSx}>{t('approvals.actions')}</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {approvals.map((approval) => (
                   <TableRow key={approval.id} hover>
                     <TableCell>{approval.id}</TableCell>
-                    <TableCell>{approval.tool_name}</TableCell>
+                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{approval.tool_name}</TableCell>
+                    <TableCell sx={{ maxWidth: 200 }}>
+                      <Typography variant="body2" noWrap title={approval.agent_name || approval.agent_id.toString()}>
+                        {approval.agent_name ?? `#${approval.agent_id}`}
+                      </Typography>
+                    </TableCell>
                     <TableCell>
                       <Chip label={riskLabel(approval.risk_level)} size="small" color={getRiskColor(approval.risk_level) as any} />
                     </TableCell>
                     <TableCell>
                       <Chip label={statusLabel(approval.status)} size="small" color={getStatusColor(approval.status) as any} variant="outlined" />
                     </TableCell>
-                    <TableCell sx={{ maxWidth: 280 }}>
-                      <Typography variant="body2" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <TableCell sx={{ minWidth: 200, maxWidth: 480, verticalAlign: 'middle' }}>
+                      <Typography variant="body2" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={approval.input || undefined}>
                         {approval.input || '—'}
                       </Typography>
                     </TableCell>
-                    <TableCell>{formatDateTime(approval.created_at)}</TableCell>
-                    <TableCell align="right">
-                      {approval.status === 'pending' && (
-                        <>
-                          <Button size="small" color="success" onClick={() => openApproveDialog(approval)}>
-                            {t('approvals.approve')}
-                          </Button>
-                          <Button size="small" color="error" onClick={() => openRejectDialog(approval)}>
-                            {t('approvals.reject')}
-                          </Button>
-                        </>
-                      )}
-                      <Button size="small" onClick={() => openDetail(approval)}>
-                        {t('approvals.detail')}
-                      </Button>
+                    <TableCell sx={{ whiteSpace: 'nowrap', verticalAlign: 'middle' }}>{formatDateTime(approval.created_at)}</TableCell>
+                    <TableCell align="center" sx={approvalsActionBodyCellSx}>
+                      <Box
+                        sx={{
+                          display: 'flex',
+                          flexWrap: 'nowrap',
+                          justifyContent: 'center',
+                          alignItems: 'center',
+                          gap: 0.5,
+                        }}
+                      >
+                        {approval.status === 'pending' && approval.can_approve === true && (
+                          <>
+                            <Button
+                              size="small"
+                              color="success"
+                              onClick={() => openApproveDialog(approval)}
+                              sx={{ minWidth: 'auto', px: 1, py: 0.25, fontSize: '0.8125rem' }}
+                            >
+                              {t('approvals.approve')}
+                            </Button>
+                            <Button
+                              size="small"
+                              color="error"
+                              onClick={() => openRejectDialog(approval)}
+                              sx={{ minWidth: 'auto', px: 1, py: 0.25, fontSize: '0.8125rem' }}
+                            >
+                              {t('approvals.reject')}
+                            </Button>
+                          </>
+                        )}
+                        <Button
+                          size="small"
+                          onClick={() => openDetail(approval)}
+                          sx={{ minWidth: 'auto', px: 1, py: 0.25, fontSize: '0.8125rem' }}
+                        >
+                          {t('approvals.detail')}
+                        </Button>
+                      </Box>
                     </TableCell>
                   </TableRow>
                 ))}
                 {approvals.length === 0 && !loading && (
                   <TableRow>
-                    <TableCell colSpan={7} align="center" sx={{ py: 8 }}>
+                    <TableCell colSpan={8} align="center" sx={{ py: 8 }}>
                       <Typography color="text.secondary">{emptyLabel()}</Typography>
                     </TableCell>
                   </TableRow>
@@ -349,8 +405,18 @@ const ApprovalsPage: React.FC = () => {
                 <Chip label={statusLabel(selectedApproval?.status || '')} size="small" color={getStatusColor(selectedApproval?.status || '') as any} />
               </Box>
               <Box>
-                <Typography variant="caption" color="text.secondary">{t('approvals.fieldAgentId')}</Typography>
-                <Typography variant="body2">{selectedApproval?.agent_id}</Typography>
+                <Typography variant="caption" color="text.secondary">{t('approvals.fieldAgentName')}</Typography>
+                <Typography variant="body2" fontWeight={600}>
+                  {selectedApproval?.agent_name ?? `#${selectedApproval?.agent_id ?? ''}`}
+                </Typography>
+              </Box>
+              <Box sx={{ gridColumn: '1 / -1' }}>
+                <Typography variant="caption" color="text.secondary">{t('approvals.fieldDesignatedApprovers')}</Typography>
+                <Typography variant="body2">
+                  {selectedApproval?.designated_approvers?.length
+                    ? selectedApproval.designated_approvers.join(', ')
+                    : '—'}
+                </Typography>
               </Box>
               <Box sx={{ gridColumn: '1 / -1' }}>
                 <Typography variant="caption" color="text.secondary">{t('approvals.fieldInput')}</Typography>

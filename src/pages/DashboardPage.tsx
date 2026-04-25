@@ -41,14 +41,20 @@ import type { Agent } from '../types';
 /** Bump when default announcement text changes so dismissed users see the new one. */
 const ANNOUNCEMENT_LOCAL_ID = 'default-2026-04';
 
-const ANNOUNCEMENT_DISMISS_KEY = 'agentsphere_dashboard_announcement_dismissed_id';
+const ANNOUNCEMENT_DISMISS_KEY = 'aitaskmeta_dashboard_announcement_dismissed_id';
+const LEGACY_ANNOUNCEMENT_DISMISS_KEY = 'sya_dashboard_announcement_dismissed_id';
 
 function readAnnouncementDismissed(): boolean {
   try {
-    return localStorage.getItem(ANNOUNCEMENT_DISMISS_KEY) === ANNOUNCEMENT_LOCAL_ID;
+    if (localStorage.getItem(ANNOUNCEMENT_DISMISS_KEY) === ANNOUNCEMENT_LOCAL_ID) return true;
+    if (localStorage.getItem(LEGACY_ANNOUNCEMENT_DISMISS_KEY) === ANNOUNCEMENT_LOCAL_ID) {
+      localStorage.setItem(ANNOUNCEMENT_DISMISS_KEY, ANNOUNCEMENT_LOCAL_ID);
+      return true;
+    }
   } catch {
     return false;
   }
+  return false;
 }
 
 function writeAnnouncementDismissed(): void {

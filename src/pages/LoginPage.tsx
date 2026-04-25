@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Box,
   TextField,
@@ -31,17 +31,30 @@ import {
   PinOutlined,
 } from '@mui/icons-material';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
-import i18n from '../i18n';
-import { useAuth } from '../contexts/AuthContext';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../contexts/useAuth';
 import { useThemeMode } from '../contexts/ThemeModeContext';
-import { getCaptcha } from '../api/auth';
+import { getCaptcha, getAuthConfig } from '../api/auth';
 import { getServerUrl, saveServerUrl } from '../api/config';
+import { pickRandomSlogan } from '../data/loginSlogans';
+
+const SSO_LOGIN_PREFIX: Record<string, string> = {
+  lark: 'LARK',
+  dingtalk: 'DINGTALK',
+  wecom: 'WECOM',
+  telegram: 'TELEGRAM',
+};
+
+function ssoLoginButtonLabel(authType: string): string {
+  const p = SSO_LOGIN_PREFIX[authType];
+  return p ? `${p} SSO 登录` : 'SSO 登录';
+}
 
 const LoginPage: React.FC = () => {
-  const { login } = useAuth();
+  const { login, completeSsoLogin } = useAuth();
   const navigate = useNavigate();
-  const { t } = useTranslation();
+  const location = useLocation();
+  const { t, i18n } = useTranslation();
   const { mode, toggleMode } = useThemeMode();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -55,6 +68,58 @@ const LoginPage: React.FC = () => {
   const [captchaImage, setCaptchaImage] = useState('');
   const [captchaCode, setCaptchaCode] = useState('');
   const [captchaLoading, setCaptchaLoading] = useState(false);
+  const [authType, setAuthType] = useState('password'); // password | lark | dingtalk | wecom | telegram
+  const [captchaDisabled, setCaptchaDisabled] = useState(false);
+  const [loginSlogan, setLoginSlogan] = useState(() => pickRandomSlogan(i18n.language));
+  const [ssoBusy, setSsoBusy] = useState(false);
+  const prevLangRef = useRef(i18n.language);
+
+  /** 后端 SSO 成功后在 SSO_OAUTH_SUCCESS_REDIRECT 上附加 access_token（与网页端一致） */
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const access = params.get('access_token');
+    if (!access) return;
+    setSsoBusy(true);
+    const refresh = params.get('refresh_token') || undefined;
+    let alive = true;
+    void (async () => {
+      try {
+        await completeSsoLogin(access, refresh);
+        if (!alive) return;
+        navigate('/', { replace: true });
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : 'SSO login failed');
+        navigate('/login', { replace: true });
+      } finally {
+        if (alive) setSsoBusy(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [location.search, completeSsoLogin, navigate]);
+
+  useEffect(() => {
+    if (prevLangRef.current === i18n.language) return;
+    prevLangRef.current = i18n.language;
+    setLoginSlogan(pickRandomSlogan(i18n.language));
+  }, [i18n.language]);
+
+  // 加载认证配置
+  useEffect(() => {
+    getAuthConfig()
+      .then(cfg => {
+        setAuthType(cfg.auth_type);
+        setCaptchaDisabled(cfg.captcha_disabled);
+        if (!cfg.captcha_disabled) {
+          fetchCaptcha();
+        }
+      })
+      .catch(() => {
+        fetchCaptcha();
+      });
+  }, []);
 
   const toggleLanguage = () => {
     void i18n.changeLanguage(i18n.language === 'en' ? 'zh' : 'en');
@@ -84,7 +149,6 @@ const LoginPage: React.FC = () => {
       setServerUrl(url);
       setUrlInput(url);
     });
-    void fetchCaptcha();
   }, []);
 
   const openSettings = () => {
@@ -113,6 +177,36 @@ const LoginPage: React.FC = () => {
       setLoading(false);
     }
   };
+
+  const handleSsoLogin = () => {
+    const base = (serverUrl || '').replace(/\/$/, '');
+    if (!base) {
+      setError(t('login.serverUrlRequiredForSso'));
+      return;
+    }
+    window.location.href = `${base}/api/v1/auth/sso/${authType}`;
+  };
+
+  if (ssoBusy) {
+    return (
+      <Box
+        sx={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          bgcolor: 'background.default',
+        }}
+      >
+        <Stack alignItems="center" spacing={2}>
+          <CircularProgress />
+          <Typography variant="body2" color="text.secondary">
+            {t('login.ssoCompleting')}
+          </Typography>
+        </Stack>
+      </Box>
+    );
+  }
 
   return (
     <Box
@@ -257,7 +351,7 @@ const LoginPage: React.FC = () => {
             {t('app.name')}
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 320, mx: 'auto', lineHeight: 1.6 }}>
-            {t('login.subtitle')}
+            {loginSlogan}
           </Typography>
         </Box>
 
@@ -296,6 +390,21 @@ const LoginPage: React.FC = () => {
           </Alert>
         )}
 
+        {/* SSO：仅展示单点登录，不展示账号密码 */}
+        {authType !== 'password' && (
+          <Button
+            fullWidth
+            variant="contained"
+            size="large"
+            startIcon={<SmartToy />}
+            onClick={handleSsoLogin}
+            sx={{ py: 1.5 }}
+          >
+            {ssoLoginButtonLabel(authType)}
+          </Button>
+        )}
+
+        {authType === 'password' && (
         <form onSubmit={handleSubmit}>
           <TextField
             fullWidth
@@ -342,6 +451,8 @@ const LoginPage: React.FC = () => {
             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { borderRadius: 2 } }}
           />
 
+          {/* 验证码输入 - 仅在启用时显示 */}
+          {!captchaDisabled && (
           <Box sx={{ display: 'flex', gap: 1.5, mt: 1, mb: 1, alignItems: 'stretch' }}>
             <TextField
               fullWidth
@@ -420,6 +531,7 @@ const LoginPage: React.FC = () => {
               </Box>
             </Tooltip>
           </Box>
+          )}
 
           <Button
             type="submit"
@@ -442,6 +554,7 @@ const LoginPage: React.FC = () => {
             {loading ? <CircularProgress size={24} color="inherit" /> : t('login.signIn')}
           </Button>
         </form>
+        )}
       </Paper>
 
       <Dialog open={settingsOpen} onClose={() => setSettingsOpen(false)} fullWidth maxWidth="sm">

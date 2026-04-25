@@ -1,20 +1,9 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import type { User } from '../types';
-import { login as apiLogin } from '../api/auth';
+import { login as apiLogin, fetchMe } from '../api/auth';
 import { getServerUrl, saveServerUrl } from '../api/config';
 import { invalidateClientModeToolsCache, reloadClientModeTools } from '../api/chat';
-
-interface AuthContextType {
-  user: User | null;
-  accessToken: string | null;
-  serverUrl: string;
-  login: (username: string, password: string, captchaToken?: string, captchaCode?: string) => Promise<void>;
-  logout: () => void;
-  isAuthenticated: boolean;
-  setServerUrl: (url: string) => Promise<void>;
-}
-
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+import { AuthContext } from './auth-context';
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
@@ -58,6 +47,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(response.user);
   }, []);
 
+  const completeSsoLogin = useCallback(async (token: string, refresh?: string) => {
+    localStorage.setItem('access_token', token);
+    if (refresh) {
+      localStorage.setItem('refresh_token', refresh);
+    }
+    const me = await fetchMe();
+    localStorage.setItem('user', JSON.stringify(me));
+    setAccessToken(token);
+    setUser(me);
+  }, []);
+
+  const refreshUser = useCallback(async () => {
+    const me = await fetchMe();
+    localStorage.setItem('user', JSON.stringify(me));
+    setUser(me);
+  }, []);
+
   const logout = useCallback(() => {
     invalidateClientModeToolsCache();
     localStorage.removeItem('access_token');
@@ -68,16 +74,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, accessToken, serverUrl, login, logout, isAuthenticated: !!accessToken, setServerUrl }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        accessToken,
+        serverUrl,
+        login,
+        completeSsoLogin,
+        refreshUser,
+        logout,
+        isAuthenticated: !!accessToken,
+        setServerUrl,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
-};
-
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within AuthProvider');
-  }
-  return context;
 };

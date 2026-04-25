@@ -10,11 +10,18 @@ import { ThemeProvider, CssBaseline } from '@mui/material';
 import type { PaletteMode } from '@mui/material';
 import { createAppTheme } from '../theme';
 
-const STORAGE_KEY = 'agentsphere_theme_mode';
+const STORAGE_KEY = 'aitaskmeta_theme_mode';
+const LEGACY_STORAGE_KEY = 'sya_theme_mode';
 
 function readStoredMode(): PaletteMode {
   try {
-    const v = localStorage.getItem(STORAGE_KEY);
+    let v = localStorage.getItem(STORAGE_KEY);
+    if (v !== 'light' && v !== 'dark') {
+      v = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (v === 'light' || v === 'dark') {
+        localStorage.setItem(STORAGE_KEY, v);
+      }
+    }
     if (v === 'light' || v === 'dark') return v;
   } catch {
     /* ignore */
